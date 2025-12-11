@@ -1,0 +1,25 @@
+[project]
+name = "deepseek-indexer-viz"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "transformers>=4.30.0",
+    "torch>=2.1.0",
+    "safetensors>=0.3.1",
+    "fast_hadamard_transform",
+    "tilelang==0.1.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black",
+    "ruff",
+    "pytest",
+]
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I"]
