@@ -103,7 +103,7 @@ def main():
     parser.add_argument("--config", type=str, required=True, help="Path to JSON config")
     args_cli = parser.parse_args()
 
-    # --- Distributed Init ---
+    # Distributed Init
     world_size = int(os.getenv("WORLD_SIZE", "1"))
     rank = int(os.getenv("RANK", "0"))
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
