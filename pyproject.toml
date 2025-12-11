@@ -8,7 +8,10 @@ dependencies = [
     "safetensors>=0.3.1",
     "fast_hadamard_transform",
     "tilelang==0.1.6",
+    "tqdm",
 ]
+[tool.uv.extra-build-dependencies]
+fast_hadamard_transform = ["torch"]
 
 [project.optional-dependencies]
 dev = [
