@@ -17,6 +17,10 @@ BF16 = "bfloat16"
 FP32 = "float32"
 
 
+# fast_log2_ceil:
+# Computes an approximate log2 of `x` by reinterpreting the float32 bit representation as an integer.
+# It extracts the exponent (`exp_x`) and mantissa (`man_bits`) using bitwise shifts and masks.
+# The result is derived from the exponent bias (127) and a correction if the mantissa is non-zero, returning an integer approximation.
 def fast_log2_ceil(x):
     bits_x = T.reinterpret("uint32", x)
     exp_x = (bits_x >> 23) & 0xFF
@@ -24,15 +28,27 @@ def fast_log2_ceil(x):
     return T.Cast("int32", exp_x - 127 + T.if_then_else(man_bits != 0, 1, 0))
 
 
+# fast_pow2:
+# Computes an approximate power of 2 for input `x` using bitwise manipulation.
+# It shifts the input `x` (offset by the bias 127) into the exponent position of a float32 representation.
+# The resulting integer bit pattern is then reinterpreted back as a float32, effectively calculating 2^x.
 def fast_pow2(x):
     bits_x = (x + 127) << 23
     return T.reinterpret("float32", bits_x)
 
 
+# fast_round_scale:
+# Calculates a power-of-2 scaling factor for quantization based on the maximum absolute value `amax`.
+# It multiplies `amax` by the inverse of the FP8 max value to normalize the range.
+# Then calls `fast_log2_ceil` and `fast_pow2` to snap this normalized scale to the nearest upper power of 2.
 def fast_round_scale(amax, fp8_max_inv):
     return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
 
 
+# act_quant_kernel:
+# Defines a TileLang JIT kernel for activation quantization that divides input `X` into blocks of `blk_m` x `group_size`.
+# It loads data to shared memory, computes the row-wise max (`amax_local`), and determines scales (`s_local`) (optionally rounding them).
+# Finally, it normalizes elements by `s_local`, clamps them to the FP8 range, and stores the quantized `Y` and scales `S`.
 @tilelang.jit(pass_configs=pass_configs)
 def act_quant_kernel(
     N, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32, round_scale=False
@@ -84,6 +100,10 @@ def act_quant_kernel(
     return act_quant_kernel_
 
 
+# act_quant:
+# Serves as the high-level entry point for activation quantization, verifying input contiguousness and block alignment.
+# It instantiates output tensors `y` (FP8) and `s` (scales), then invokes the JIT-compiled `act_quant_kernel`.
+# The function flattens inputs to manage dynamic shapes before returning the quantized tensor and its scales.
 def act_quant(
     x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -111,6 +131,10 @@ def act_quant(
     return y, s
 
 
+# fp8_gemm_kernel:
+# Defines a pipelined FP8 General Matrix Multiplication (GEMM) kernel that computes C = A * B.
+# It manages shared memory loads for tiles of A, B, and their scales, fusing the scale multiplication into the accumulation loop.
+# The kernel utilizes swizzling for L2 cache efficiency and accumulates in `accum_dtype` (float32) before storing the final result.
 @tilelang.jit(pass_configs=pass_configs)
 def fp8_gemm_kernel(N, K, out_dtype=BF16, accum_dtype="float32"):
     assert out_dtype in [BF16, "float32"]
@@ -168,6 +192,10 @@ def fp8_gemm_kernel(N, K, out_dtype=BF16, accum_dtype="float32"):
     return fp8_gemm_kernel_
 
 
+# fp8_gemm:
+# Orchestrates the FP8 matrix multiplication by checking input contiguousness and flattening tensors for the kernel.
+# It allocates the result tensor `c` and dispatches the `fp8_gemm_kernel` with the appropriate problem sizes.
+# The inputs include matrices `a` and `b` along with their corresponding block-wise scaling factors `a_s` and `b_s`.
 def fp8_gemm(
     a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor, b_s: torch.Tensor
 ) -> torch.Tensor:
@@ -196,6 +224,10 @@ def fp8_gemm(
     return c
 
 
+# fp8_index_kernel:
+# Defines a specialized kernel for computing index scores using FP8 vector-matrix operations.
+# It loads a query vector `q` and iterates over key vectors `k`, performing a GEMM to get logits.
+# It applies ReLU activation, scales the logits using `q_s` and `k_s`, and sums them to produce the final `o` scores.
 @tilelang.jit(out_idx=[4], pass_configs=pass_configs)
 def fp8_index_kernel(h: int, d: int):
     b = T.symbolic("b")
@@ -251,6 +283,10 @@ def fp8_index_kernel(h: int, d: int):
     return fp8_index_kernel_
 
 
+# fp8_index:
+# High-level wrapper for the `fp8_index_kernel` that computes expert routing scores using FP8 precision.
+# It invokes the JIT-compiled kernel with query `q` and key `k` tensors and their respective scales.
+# The calculation involves `ReLU(q @ k.T) * scales` to effectively score the relevance of experts.
 def fp8_index(
     q: torch.Tensor,
     q_s: torch.Tensor,

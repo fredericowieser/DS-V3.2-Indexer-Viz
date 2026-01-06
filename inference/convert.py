@@ -34,6 +34,10 @@ mapping = {
 }
 
 
+# main:
+# Converts Hugging Face checkpoint files into the specific format required by the inference engine.
+# It iterates through all SafeTensors files, renames parameters based on a predefined `mapping`, and handles specific tensor transformations.
+# Crucially, it shards tensors for Model Parallelism (MP) by splitting them along specified dimensions or by filtering experts for MoE layers based on the rank.
 def main(hf_ckpt_path, save_path, n_experts, mp):
     """
     Converts and saves model checkpoint files into a specified format.

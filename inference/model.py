@@ -97,6 +97,10 @@ class ParallelEmbedding(nn.Module):
         vocab_size (int): Vocabulary size.
         dim (int): Embedding dimension.
     """
+    # ParallelEmbedding.__init__:
+    # Initializes the embedding layer for distributed training.
+    # It calculates the partition of the vocabulary based on `rank` and `world_size`.
+    # The weight parameter is allocated only for the local partition (`part_vocab_size`).
     def __init__(self, vocab_size: int, dim: int):
         super().__init__()
         self.vocab_size = vocab_size
@@ -107,6 +111,10 @@ class ParallelEmbedding(nn.Module):
         self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
         self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
 
+    # ParallelEmbedding.forward:
+    # Computes embeddings with parallel support.
+    # It masks input tokens that fall outside the local vocabulary partition.
+    # After local embedding lookup, it performs an `all_reduce` to combine results across processes.
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for parallel embedding layer.
@@ -131,6 +139,10 @@ class ParallelEmbedding(nn.Module):
         return y
 
 
+# linear:
+# Helper function to dispatch linear operations.
+# It checks if weights are quantized (`float8_e4m3fn`). If so, it uses the custom `fp8_gemm` pipeline.
+# Otherwise, it falls back to the standard PyTorch `F.linear`.
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None,
            scale_fmt: Optional[str] = None) -> torch.Tensor:
     """
@@ -176,6 +188,10 @@ class Linear(nn.Module):
     dtype = torch.bfloat16
     scale_fmt: Optional[str] = None
 
+    # Linear.__init__:
+    # Initializes a linear layer with optional FP8 quantization support.
+    # If `element_size() == 1` (implying FP8), it initializes a `scale` parameter for quantization.
+    # Handles bias initialization based on the `bias` flag.
     def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
         super().__init__()
         self.in_features = in_features
@@ -192,6 +208,9 @@ class Linear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
+    # Linear.forward:
+    # Delegates the forward pass to the `linear` helper function.
+    # Pass the layer's weights, bias, and scale format to handle the computation.
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for the custom linear layer.
@@ -215,11 +234,17 @@ class ColumnParallelLinear(Linear):
         bias (bool): Whether to include a bias term. Defaults to False.
         dtype (optional): Data type for the layer. Defaults to `torch.bfloat16`.
     """
+    # ColumnParallelLinear.__init__:
+    # Initializes a column-parallel linear layer where output features are split across ranks.
+    # It ensures `out_features` is divisible by `world_size` and initializes the superclass with the partitioned output size.
     def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
         assert out_features % world_size == 0, f"Output features must be divisible by world size (world_size={world_size})"
         self.part_out_features = out_features // world_size
         super().__init__(in_features, self.part_out_features, bias, dtype)
 
+    # ColumnParallelLinear.forward:
+    # Executes the forward pass using the `linear` helper.
+    # The result is partial (split along the column dimension) and remains distributed.
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for column parallel linear layer.
@@ -244,12 +269,18 @@ class RowParallelLinear(Linear):
         bias (bool): Whether to include a bias term. Defaults to False.
         dtype (optional): Data type for the layer. Defaults to `torch.bfloat16`.
     """
+    # RowParallelLinear.__init__:
+    # Initializes a row-parallel linear layer where input features are split across ranks.
+    # It ensures `in_features` is divisible by `world_size` and initializes the superclass with the partitioned input size.
     def __init__(self, in_features: int, out_features: int, bias: bool = False, reduce_output = True, dtype = None):
         assert in_features % world_size == 0, f"Input features must be divisible by world size (world_size={world_size})"
         self.part_in_features = in_features // world_size
         self.reduce_output = reduce_output
         super().__init__(self.part_in_features, out_features, bias, dtype)
 
+    # RowParallelLinear.forward:
+    # Executes the forward pass and optionally reduces the output across all ranks.
+    # If `reduce_output` is True, it triggers an `all_reduce` to sum the partial results from all processes.
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for row parallel linear layer.
@@ -277,12 +308,19 @@ class RMSNorm(nn.Module):
         dim (int): Dimension of the input tensor.
         eps (float): Epsilon value for numerical stability. Defaults to 1e-6.
     """
+    # RMSNorm.__init__:
+    # Initializes the RMSNorm layer.
+    # It sets up a learnable weight parameter (scaling factor) initialized to ones and stores the epsilon value for stability.
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
+    # RMSNorm.forward:
+    # Computes Root Mean Square Layer Normalization.
+    # It calculates the root mean square of the input (or residual), normalizes the input by this value, and scales it by the learned weight.
+    # Supports an optional residual connection, returning both the normalized output and the updated residual.
     def forward(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None):
         """
         Forward pass for RMSNorm.
@@ -310,6 +348,9 @@ class LayerNorm(nn.Module):
     """
     Layer Normalization.
     """
+    # LayerNorm.__init__:
+    # Initializes the LayerNorm layer.
+    # It defines learnable weight (scale) and bias parameters, initialized to ones and zeros respectively.
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.dim = dim
@@ -317,10 +358,17 @@ class LayerNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
+    # LayerNorm.forward:
+    # Computes standard Layer Normalization using PyTorch's `F.layer_norm`.
+    # It normalizes the input across the last dimension using the stored weight, bias, and epsilon.
     def forward(self, x: torch.Tensor):
         return F.layer_norm(x.float(), (self.dim,), self.weight, self.bias, self.eps).type_as(x)
 
 
+# precompute_freqs_cis:
+# Precomputes complex exponential values (frequencies) for Rotary Positional Embeddings (RoPE).
+# It handles "Yarn" extrapolation for sequences longer than the original training length by adjusting frequencies.
+# Returns a tensor of complex values `freqs_cis` for applying rotations.
 def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
     """
     Precomputes frequency-based complex exponential values for rotary positional embeddings.
@@ -338,6 +386,9 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
     base = args.rope_theta
     factor = args.rope_factor
 
+    # find_correction_dim:
+    # Calculates the dimension index where the wavelength of the rotary embedding matches the needed correction.
+    # This helps identify which parts of the embedding vector need frequency adjustment for long sequences.
     def find_correction_dim(num_rotations, dim, base, max_seq_len):
         """
         Computes the correction dimension for a given number of rotations in the rotary positional embedding.
@@ -353,6 +404,9 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
         """
         return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
 
+    # find_correction_range:
+    # Determines the range of dimensions [low, high] that require smooth frequency interpolation.
+    # It uses `beta_fast` and `beta_slow` parameters to bound this range based on the sequence length ratio.
     def find_correction_range(low_rot, high_rot, dim, base, max_seq_len):
         """
         Computes the range of correction dimensions for rotary positional embeddings.
@@ -371,6 +425,9 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
         high = math.ceil(find_correction_dim(high_rot, dim, base, max_seq_len))
         return max(low, 0), min(high, dim-1)
 
+    # linear_ramp_factor:
+    # Generates a linear ramp (0 to 1) for smooth interpolation between original and corrected frequencies.
+    # It clamps values outside the specified [min, max] range.
     def linear_ramp_factor(min, max, dim):
         """
         Computes a linear ramp function used to smooth values between a minimum and maximum range.
@@ -402,6 +459,10 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
     return freqs_cis
 
 
+# apply_rotary_emb:
+# Applies the precomputed rotary embeddings to the input tensor `x`.
+# It reshapes `x` to pairs, converts them to complex numbers, multiplies by `freqs_cis` (rotation), and converts back to real.
+# Supports both interleaved and non-interleaved memory layouts for the pairs.
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, interleaved: bool = True) -> torch.Tensor:
     """
     Applies rotary positional embeddings to the input tensor.
@@ -425,6 +486,10 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, interleaved: bool
     return y.to(dtype)
 
 
+# rotate_activation:
+# Applies a Hadamard transform to the input activation `x`.
+# This is a random-like rotation used in some attention variants (like MLA) to spread information across dimensions.
+# It uses a specialized `hadamard_transform` kernel for efficiency.
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.bfloat16
     from fast_hadamard_transform import hadamard_transform
@@ -433,6 +498,10 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
 
 class Indexer(torch.nn.Module):
+    # Indexer.__init__:
+    # Initializes the Indexer module used for expert routing/selection.
+    # It sets up projections for query (`wq_b`), key (`wk`), and expert weights (`weights_proj`).
+    # Allocates persistent buffers `k_cache` and `k_scale_cache` for caching keys during generation.
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.dim: int = args.dim
@@ -454,6 +523,10 @@ class Indexer(torch.nn.Module):
         self.register_buffer("k_scale_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.head_dim // block_size, dtype=torch.float32), persistent=False)
 
 
+    # Indexer.forward:
+    # Computes the top-k expert indices for the current step.
+    # It projects inputs to Q and K, applies RoPE and rotation, quantizes K, and updates the KV cache.
+    # Then it computes attention scores between Q and cached K (using `fp8_index`) to determine the most relevant experts.
     def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
@@ -487,6 +560,10 @@ class Indexer(torch.nn.Module):
         return topk_indices
 
 
+# weight_dequant:
+# Dequantizes FP8 weights to higher precision (BF16/FP32).
+# It reshapes the block-wise quantized weight and scale tensors to align dimensions.
+# Performs element-wise multiplication of the float-casted weight and scale, then restores the original shape.
 def weight_dequant(weight, scale):
     shape = weight.shape
     assert weight.dim() == 2
@@ -511,6 +588,10 @@ class MLA(nn.Module):
         v_head_dim (int): Dimensionality of value projections.
         softmax_scale (float): Scaling factor for softmax in attention computation.
     """
+    # MLA.__init__:
+    # Initializes the Multi-Head Latent Attention (MLA) layer.
+    # Sets up LoRA projections for Q/K/V, norms, and output projection.
+    # Initializes the `Indexer` submodule and allocates KV/PE caches for efficient inference.
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.dim = args.dim
@@ -542,6 +623,11 @@ class MLA(nn.Module):
         self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
         self.dequant_wkv_b = None
 
+    # MLA.forward:
+    # Performs the full attention mechanism. Projects inputs, handles RoPE, and updates the KV cache.
+    # In "prefill" (mask is present), it computes full causal attention.
+    # In "decode", it uses cached KV/PE and optimizes computation, optionally dequantizing weights on the fly.
+    # Incorporates `Indexer` scores to adjust attention based on expert relevance.
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
         """
         Forward pass for the Multi-Head Latent Attention (MLA) Layer.
@@ -617,6 +703,10 @@ class MLP(nn.Module):
         w2 (nn.Module): Linear layer for hidden-to-output transformation.
         w3 (nn.Module): Additional linear layer for feature transformation.
     """
+    # MLP.__init__:
+    # Initializes a standard Feed-Forward Network.
+    # Defines three linear layers: `w1` (gate), `w3` (up-projection), and `w2` (down-projection).
+    # Supports distributed training via `ColumnParallelLinear` and `RowParallelLinear`.
     def __init__(self, dim: int, inter_dim: int, reduce_output: bool = True):
         """
         Initializes the MLP layer.
@@ -630,6 +720,9 @@ class MLP(nn.Module):
         self.w2 = RowParallelLinear(inter_dim, dim, reduce_output=reduce_output)
         self.w3 = ColumnParallelLinear(dim, inter_dim)
 
+    # MLP.forward:
+    # Computes the SwiGLU activation function: `w2(SiLU(w1(x)) * w3(x))`.
+    # Takes input `x`, projects it through gate and value paths, applies SiLU, and projects back to output dimension.
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for the MLP layer.
@@ -657,6 +750,10 @@ class Gate(nn.Module):
         weight (torch.nn.Parameter): Learnable weights for the gate.
         bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
     """
+    # Gate.__init__:
+    # Initializes the routing gate for Mixture-of-Experts.
+    # Sets up learnable weights to score experts and parameters for top-k selection (experts per token).
+    # Configures group-limited routing logic if `n_groups > 1` to balance expert load.
     def __init__(self, args: ModelArgs):
         """
         Initializes the Gate module.
@@ -674,6 +771,10 @@ class Gate(nn.Module):
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
         self.bias = nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32)) if self.dim == 7168 else None
 
+    # Gate.forward:
+    # Computes routing weights and selects the best experts for each token.
+    # Applies linear projection, optionally softmax/sigmoid, and adds bias to get raw scores.
+    # Implements group-constrained routing: selects top groups first, then top experts within those groups, preventing dominance of few experts.
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for the gating mechanism.
@@ -718,6 +819,9 @@ class Expert(nn.Module):
         w2 (nn.Module): Linear layer for hidden-to-output transformation.
         w3 (nn.Module): Additional linear layer for feature transformation.
     """
+    # Expert.__init__:
+    # Initializes a single Expert module, which is functionally an MLP.
+    # Wraps the standard up/down projections (`w1`, `w2`, `w3`) used in the MoE block.
     def __init__(self, dim: int, inter_dim: int):
         """
         Initializes the Expert layer.
@@ -731,6 +835,9 @@ class Expert(nn.Module):
         self.w2 = Linear(inter_dim, dim)
         self.w3 = Linear(dim, inter_dim)
 
+    # Expert.forward:
+    # Performs the feed-forward computation for this specific expert.
+    # Identical to the standard MLP SwiGLU pass: `w2(SiLU(w1(x)) * w3(x))`.
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for the Expert layer.
@@ -757,6 +864,10 @@ class MoE(nn.Module):
         experts (nn.ModuleList): List of expert modules.
         shared_experts (nn.Module): Shared experts applied to all inputs.
     """
+    # MoE.__init__:
+    # Initializes the Mixture-of-Experts (MoE) layer.
+    # Distributes experts across workers (ranks), managing local vs. global expert indices.
+    # Sets up the `Gate` for routing and a `shared_experts` MLP path that is always active.
     def __init__(self, args: ModelArgs):
         """
         Initializes the MoE module.
@@ -777,6 +888,12 @@ class MoE(nn.Module):
                                       for i in range(self.n_routed_experts)])
         self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim, reduce_output=False)
 
+    # MoE.forward:
+    # Orchestrates the MoE computation.
+    # 1. Routes inputs via `Gate` to get weights and indices.
+    # 2. Computes the shared expert output.
+    # 3. Iterates through local experts, processing assigned tokens and scaling by routing weights.
+    # 4. Reduces results across all workers (all_reduce) to aggregate global expert outputs.
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for the MoE module.
@@ -814,6 +931,10 @@ class Block(nn.Module):
         attn_norm (nn.Module): Layer normalization for attention.
         ffn_norm (nn.Module): Layer normalization for feed-forward network.
     """
+    # Block.__init__:
+    # Initializes a single Transformer block.
+    # Composed of an Attention layer (`MLA`) and a Feed-Forward layer (`MLP` or `MoE`), each preceeded by RMSNorm.
+    # Selects between standard MLP or MoE based on the layer index (`n_dense_layers`).
     def __init__(self, layer_id: int, args: ModelArgs):
         """
         Initializes the Transformer block.
@@ -828,6 +949,10 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm(args.dim)
         self.ffn_norm = RMSNorm(args.dim)
 
+    # Block.forward:
+    # Executes the Transformer block logic.
+    # Applies RMSNorm, then Attention (MLA), and adds the residual connection.
+    # Then applies RMSNorm again, followed by the Feed-Forward Network (FFN), and adds the residual again.
     def forward(self, x: torch.Tensor, residual: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
         """
         Forward pass for the Transformer block.
@@ -863,6 +988,10 @@ class Transformer(nn.Module):
         head (nn.Module): Output projection layer mapping to vocabulary size.
         freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
     """
+    # Transformer.__init__:
+    # Initializes the complete Transformer model.
+    # Sets up the global distributed environment variables (`world_size`, `rank`) and configures linear layer precision.
+    # Instantiates embeddings, a stack of `Block` layers, final normalization, and the output projection head.
     def __init__(self, args: ModelArgs):
         """
         Initializes the Transformer model.
@@ -886,6 +1015,11 @@ class Transformer(nn.Module):
         self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.float32)
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
 
+    # Transformer.forward:
+    # Performs the full model inference pass.
+    # Prepares RoPE frequencies and attention masks based on the sequence length and start position.
+    # Iteratively passes the input through embeddings, all transformer blocks, and final normalization.
+    # Projects the final hidden state to logits and gathers them across all workers if distributed.
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):
         """

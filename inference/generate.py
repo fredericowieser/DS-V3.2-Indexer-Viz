@@ -6,11 +6,15 @@ from typing import List
 import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
-from safetensors.torch import load_model
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
 from model import Transformer, ModelArgs
 
 
+# sample:
+# Samples a single token from the probability distribution derived from logits.
+# It applies temperature scaling to smooth or sharpen the distribution.
+# Uses a sampling trick equivalent to Gumbel-Max: `argmax(probs / Exp(1))` to sample efficiently without explicit log-softmax computation.
 def sample(logits, temperature: float = 1.0):
     """
     Samples a token from the logits using temperature scaling.
@@ -27,6 +31,11 @@ def sample(logits, temperature: float = 1.0):
     return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1)
 
 
+# generate:
+# The core autoregressive generation loop.
+# It initializes the token buffer with the prompt and iterates `max_new_tokens` times.
+# In each step, it runs the model forward, samples the next token (or greedily selects if temp=0), and updates the buffer.
+# Handles EOS tokens and updates the generation status for each sequence in the batch.
 @torch.inference_mode()
 def generate(
     model: Transformer,
@@ -78,6 +87,11 @@ def generate(
     return completion_tokens
 
 
+# main:
+# Entry point for the distributed generation script.
+# It initializes the distributed process group, loads model arguments and the sharded checkpoint for the local rank.
+# Supports two modes: "interactive" (chat loop with user input) and "batch" (processing prompts from a file).
+# Handles synchronization of inputs across ranks to ensure all processes generate for the same prompt.
 def main(
     ckpt_path: str,
     config: str,
@@ -112,11 +126,26 @@ def main(
     with open(config) as f:
         args = ModelArgs(**json.load(f))
     print(args)
-    with torch.device("cuda"):
+
+    # --- BEGIN OFFLOADING LOGIC ---
+    # Reserve ~130GB per H200 to leave room for KV cache/activations
+    max_memory = {i: "130GiB" for i in range(torch.cuda.device_count())}
+    max_memory["cpu"] = "450GiB"
+
+    with init_empty_weights():
         model = Transformer(args)
+
+    model = load_checkpoint_and_dispatch(
+        model,
+        checkpoint=ckpt_path,
+        device_map="auto",
+        max_memory=max_memory,
+        no_split_module_classes=["Block"],  # Prevents splitting residual blocks
+        dtype=torch.bfloat16
+    )
+    # --- END OFFLOADING LOGIC ---
+
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
-    print("load model")
-    load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
     print("I'm DeepSeek 👋")
 
     if interactive:

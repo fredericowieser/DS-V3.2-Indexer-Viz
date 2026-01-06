@@ -1,13 +1,18 @@
 #!/bin/bash --login
 #SBATCH --partition=agentS-xlong
 #SBATCH --gres=gpu:h200:4
-#SBATCH --job-name=fred_dev
+#SBATCH --job-name=deepseek_viz
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=16
 #SBATCH --time=5-00:00:00
 
-echo "Setting up environment for GPU training..."
+echo "Setting up environment for DeepSeek-V3.2 Offloading..."
 
-# Set OMP_NUM_THREADS to 1 for efficiency with torch
+# Senior Eng Note: We set this to 1 to prevent MKL/OpenMP contention with PyTorch
 export OMP_NUM_THREADS=1
+# Enable the recording logic we added to model.py
+export RECORD_INDEX=1
 
 # Install uv (if not already installed)
 if ! command -v uv &> /dev/null
@@ -31,53 +36,34 @@ export UV_HTTP_TIMEOUT=600
 uv sync
 source .venv/bin/activate
 
-
 # Configuration
-HF_MODEL_REPO="deepseek-ai/DeepSeek-V3.2"  # The repo you requested
-RAW_WEIGHTS_DIR="checkpoints/raw_weights"
-CONVERTED_WEIGHTS_DIR="checkpoints/converted_weights_tp4"
-
-echo "Model Setup Stage..."
-
-# A. Download from Hugging Face
-if [ ! -d "$RAW_WEIGHTS_DIR" ] || [ -z "$(ls -A $RAW_WEIGHTS_DIR)" ]; then
-    echo "Downloading $HF_MODEL_REPO from Hugging Face..."
-    echo "Saving to: $RAW_WEIGHTS_DIR"
-    mkdir -p "$RAW_WEIGHTS_DIR"
-    
-    # Download the repository (excluding optimizer states if any to save space)
-    huggingface-cli download "$HF_MODEL_REPO" \
-        --local-dir "$RAW_WEIGHTS_DIR" \
-        --local-dir-use-symlinks False \
-        --exclude "*.pt" "*.bin" "optimizer*"
-else
-    echo "Raw weights found in $RAW_WEIGHTS_DIR. Skipping download."
-fi
-
-# B. Convert Weights for 4 GPUs
-# The inference code requires the model to be sharded specifically for the GPU count.
-if [ ! -d "$CONVERTED_WEIGHTS_DIR" ] || [ -z "$(ls -A $CONVERTED_WEIGHTS_DIR)" ]; then
-    echo "Converting weights for 4-GPU Tensor Parallelism..."
-    echo "Saving to: $CONVERTED_WEIGHTS_DIR"
-    mkdir -p "$CONVERTED_WEIGHTS_DIR"
-
-    # Run the conversion script included in the repo
-    # --n-experts 256 is standard for V3.2 architectures
-    # --model-parallel 4 matches your 4-GPU allocation
-    python inference/convert.py \
-        --hf-ckpt-path "$RAW_WEIGHTS_DIR" \
-        --save-path "$CONVERTED_WEIGHTS_DIR" \
-        --n-experts 256 \
-        --model-parallel 4
-else
-    echo "Converted weights found in $CONVERTED_WEIGHTS_DIR. Skipping conversion."
-fi
-
-echo "Starting GPU run..."
-
+HF_MODEL_REPO="deepseek-ai/DeepSeek-V3.2" 
+WEIGHTS_DIR="checkpoints/raw_weights"
 CONFIG_PATH="inference/config_671B_v3.2.json"
 
-# Run with torchrun on 4 GPUs
-torchrun --nproc_per_node=4 main.py \
-    --ckpt-path "$CONVERTED_CKPT_DIR" \
-    --config "$CONFIG_PATH"
+# A. Download Weights
+# Note: We prioritize .safetensors for use with load_checkpoint_and_dispatch
+if [ ! -d "$WEIGHTS_DIR" ] || [ -z "$(ls -A $WEIGHTS_DIR)" ]; then
+    echo "Downloading model weights..."
+    mkdir -p "$WEIGHTS_DIR"
+    huggingface-cli download "$HF_MODEL_REPO" \
+        --local-dir "$WEIGHTS_DIR" \
+        --local-dir-use-symlinks False \
+        --include "*.safetensors" "config.json" "tokenizer.json"
+else
+    echo "Weights found. Skipping download."
+fi
+
+echo "Starting Analysis Run..."
+echo "Recording activations to index_activations.csv"
+
+# IMPORTANT: We use 'python' NOT 'torchrun'. 
+# Accelerate's device_map="auto" handles all 4 GPUs within this single process.
+# This allows us to shard the 671B model across 4xVRAM + System RAM.
+
+python inference/generate.py \
+    --ckpt-path "$WEIGHTS_DIR" \
+    --config "$CONFIG_PATH" \
+    --interactive \
+    --max-new-tokens 5 \
+    --temperature 0.0
