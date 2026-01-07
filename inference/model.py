@@ -486,13 +486,43 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, interleaved: bool
     return y.to(dtype)
 
 
+def custom_hadamard_transform(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """
+    Applies a Hadamard transform to the input tensor `x` using a naive implementation.
+
+    Args:
+        x (torch.Tensor): Input tensor to be transformed.
+        scale (float): Scaling factor to be applied after the transform.
+
+    Returns:
+        torch.Tensor: Transformed tensor after applying the Hadamard transform and scaling.
+    """
+    assert x.dtype == torch.bfloat16
+    n = x.size(-1)
+    assert (n & (n - 1)) == 0, "Hadamard transform requires the last dimension to be a power of 2."
+    x = x.float()
+    h = 1
+    while h < n:
+        for i in range(0, n, h * 2):
+            for j in range(i, i + h):
+                x1 = x[..., j]
+                x2 = x[..., j + h]
+                x[..., j] = x1 + x2
+                x[..., j + h] = x1 - x2
+        h *= 2
+    return (x * scale).to(torch.bfloat16)
+
+
 # rotate_activation:
 # Applies a Hadamard transform to the input activation `x`.
 # This is a random-like rotation used in some attention variants (like MLA) to spread information across dimensions.
 # It uses a specialized `hadamard_transform` kernel for efficiency.
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.bfloat16
-    from fast_hadamard_transform import hadamard_transform
+    try:
+        from fast_hadamard_transform import hadamard_transform
+    except ImportError:
+        hadamard_transform = custom_hadamard_transform
     hidden_size = x.size(-1)
     return hadamard_transform(x, scale=hidden_size ** -0.5)
 

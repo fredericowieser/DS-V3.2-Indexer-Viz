@@ -8,7 +8,7 @@ dependencies = [
     "safetensors>=0.3.1",
     "tilelang==0.1.6",
     "tqdm",
-    "fast_hadamard_transform",
+    # "fast_hadamard_transform",
     "accelerate>=0.26.0",
     "huggingface_hub",  # Added for reliable weight downloading
 ]
