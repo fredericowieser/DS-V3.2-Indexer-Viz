@@ -141,7 +141,8 @@ def main(
         device_map="auto",
         max_memory=max_memory,
         no_split_module_classes=["Block"],  # Prevents splitting residual blocks
-        dtype=torch.bfloat16
+        dtype=torch.bfloat16,
+        strict=False,
     )
     # --- END OFFLOADING LOGIC ---
 

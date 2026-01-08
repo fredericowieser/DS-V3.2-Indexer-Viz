@@ -49,7 +49,7 @@ if [ ! -d "$WEIGHTS_DIR" ] || [ -z "$(ls -A $WEIGHTS_DIR)" ]; then
     huggingface-cli download "$HF_MODEL_REPO" \
         --local-dir "$WEIGHTS_DIR" \
         --local-dir-use-symlinks False \
-        --include "*.safetensors" "config.json" "tokenizer.json"
+        --include "*.safetensors" "*.json"
 else
     echo "Weights found. Skipping download."
 fi
