@@ -65,5 +65,5 @@ python inference/generate.py \
     --ckpt-path "$WEIGHTS_DIR" \
     --config "$CONFIG_PATH" \
     --interactive \
-    --max-new-tokens 5 \
+    --max-new-tokens 1 \
     --temperature 0.0

@@ -127,8 +127,7 @@ def main(
         args = ModelArgs(**json.load(f))
     print(args)
 
-    # --- BEGIN OFFLOADING LOGIC ---
-    # Reserve ~130GB per H200 to leave room for KV cache/activations
+    # Offloading logic
     max_memory = {i: "130GiB" for i in range(torch.cuda.device_count())}
     max_memory["cpu"] = "450GiB"
 
@@ -140,11 +139,10 @@ def main(
         checkpoint=ckpt_path,
         device_map="auto",
         max_memory=max_memory,
-        no_split_module_classes=["Block"],  # Prevents splitting residual blocks
+        no_split_module_classes=["Block"],
         dtype=torch.bfloat16,
         strict=False,
     )
-    # --- END OFFLOADING LOGIC ---
 
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
     print("I'm DeepSeek 👋")
