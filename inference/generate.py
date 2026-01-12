@@ -7,8 +7,9 @@ import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+from accelerate.utils import set_module_tensor_to_device
 
-from model import Transformer, ModelArgs
+from model import Transformer, ModelArgs, precompute_freqs_cis
 
 
 # sample:
@@ -133,6 +134,13 @@ def main(
 
     with init_empty_weights():
         model = Transformer(args)
+
+    # Materialize buffers that are not in the checkpoint (caches, constants)
+    # and initialize all other meta buffers to zero
+    set_module_tensor_to_device(model, "freqs_cis", "cpu", precompute_freqs_cis(args))
+    for name, buf in model.named_buffers():
+        if buf.device.type == "meta" and name != "freqs_cis":
+            set_module_tensor_to_device(model, name, "cpu", torch.zeros(buf.size(), dtype=buf.dtype))
 
     os.makedirs("offload", exist_ok=True)
     model = load_checkpoint_and_dispatch(
