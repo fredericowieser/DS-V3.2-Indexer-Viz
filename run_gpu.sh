@@ -9,7 +9,7 @@
 
 echo "Setting up environment for DeepSeek-V3.2 Offloading..."
 
-# Senior Eng Note: We set this to 1 to prevent MKL/OpenMP contention with PyTorch
+# We set this to 1 to prevent MKL/OpenMP contention with PyTorch
 export OMP_NUM_THREADS=1
 # Enable the recording logic we added to model.py
 export RECORD_INDEX=1
@@ -54,13 +54,11 @@ else
     echo "Weights found. Skipping download."
 fi
 
-echo "Starting Analysis Run..."
-echo "Recording activations to index_activations.csv"
-
 # IMPORTANT: We use 'python' NOT 'torchrun'. 
 # Accelerate's device_map="auto" handles all 4 GPUs within this single process.
 # This allows us to shard the 671B model across 4xVRAM + System RAM.
 
+echo "Running inference..."
 python inference/generate.py \
     --ckpt-path "$WEIGHTS_DIR" \
     --config "$CONFIG_PATH" \
