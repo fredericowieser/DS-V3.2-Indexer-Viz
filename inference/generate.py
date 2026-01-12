@@ -134,6 +134,7 @@ def main(
     with init_empty_weights():
         model = Transformer(args)
 
+    os.makedirs("offload", exist_ok=True)
     model = load_checkpoint_and_dispatch(
         model,
         checkpoint=ckpt_path,
@@ -142,6 +143,8 @@ def main(
         no_split_module_classes=["Block"],
         dtype=torch.bfloat16,
         strict=False,
+        offload_folder="offload",
+        offload_buffers=True,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
