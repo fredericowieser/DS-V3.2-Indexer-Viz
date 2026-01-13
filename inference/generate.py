@@ -96,7 +96,7 @@ def generate(
 def main(
     ckpt_path: str,
     config: str,
-    input_file: str = "",
+    input_file: str = "Lorem ipsum",
     interactive: bool = True,
     max_new_tokens: int = 100,
     temperature: float = 1.0,
@@ -216,7 +216,7 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--ckpt-path", type=str, required=True)
     parser.add_argument("--config", type=str, required=True)
-    parser.add_argument("--input-file", type=str, default="")
+    parser.add_argument("--input-file", type=str, default="Lorem ipsum")
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=200)
     parser.add_argument("--temperature", type=float, default=0.6)
