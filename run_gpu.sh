@@ -54,13 +54,28 @@ else
     echo "Weights found. Skipping download."
 fi
 
+# B. Convert Weights
+# The inference code expects specific parameter names and structure that differ from the raw HF weights.
+CONVERTED_WEIGHTS_DIR="checkpoints/converted_weights"
+if [ ! -d "$CONVERTED_WEIGHTS_DIR" ] || [ -z "$(ls -A $CONVERTED_WEIGHTS_DIR)" ]; then
+    echo "Converting weights to local format..."
+    mkdir -p "$CONVERTED_WEIGHTS_DIR"
+    python inference/convert.py \
+        --hf-ckpt-path "$WEIGHTS_DIR" \
+        --save-path "$CONVERTED_WEIGHTS_DIR" \
+        --n-experts 256 \
+        --model-parallel 1
+else
+    echo "Converted weights found. Skipping conversion."
+fi
+
 # IMPORTANT: We use 'python' NOT 'torchrun'. 
 # Accelerate's device_map="auto" handles all 4 GPUs within this single process.
 # This allows us to shard the 671B model across 4xVRAM + System RAM.
 
 echo "Running inference..."
 python inference/generate.py \
-    --ckpt-path "$WEIGHTS_DIR" \
+    --ckpt-path "$CONVERTED_WEIGHTS_DIR" \
     --config "$CONFIG_PATH" \
     --interactive \
     --max-new-tokens 1 \
