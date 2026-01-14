@@ -1,5 +1,6 @@
 import os
 import shutil
+import json
 from argparse import ArgumentParser
 from glob import glob
 from tqdm import tqdm, trange
@@ -34,10 +35,6 @@ mapping = {
 }
 
 
-# main:
-# Converts Hugging Face checkpoint files into the specific format required by the inference engine.
-# It iterates through all SafeTensors files, renames parameters based on a predefined `mapping`, and handles specific tensor transformations.
-# Crucially, it shards tensors for Model Parallelism (MP) by splitting them along specified dimensions or by filtering experts for MoE layers based on the rank.
 def main(hf_ckpt_path, save_path, n_experts, mp):
     """
     Converts and saves model checkpoint files into a specified format.
@@ -52,42 +49,87 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
         None
     """
     torch.set_num_threads(8)
-    n_local_experts = n_experts // mp
-    state_dicts = [{} for _ in range(mp)]
-
-    for file_path in tqdm(glob(os.path.join(hf_ckpt_path, "*.safetensors"))):
-        with safe_open(file_path, framework="pt", device="cpu") as f:
-            for name in f.keys():
-                if "model.layers.61" in name:
-                    continue
-                param: torch.Tensor = f.get_tensor(name)
-                if name.startswith("model."):
-                    name = name[len("model."):]
-                name = name.replace("self_attn", "attn")
-                name = name.replace("mlp", "ffn")
-                name = name.replace("weight_scale_inv", "scale")
-                name = name.replace("e_score_correction_bias", "bias")
-                key = name.split(".")[-2]
-                assert key in mapping, f"Key {key} not found in mapping"
-                new_key, dim = mapping[key]
-                name = name.replace(key, new_key)
-                for i in range(mp):
-                    new_param = param
-                    if "experts" in name and "shared_experts" not in name:
-                        idx = int(name.split(".")[-3])
-                        if idx < i * n_local_experts or idx >= (i + 1) * n_local_experts:
-                            continue
-                    elif dim is not None:
-                        assert param.size(dim) % mp == 0, f"Dimension {dim} must be divisible by {mp}"
-                        shard_size = param.size(dim) // mp
-                        new_param = param.narrow(dim, i * shard_size, shard_size).contiguous()
-                    state_dicts[i][name] = new_param
-
     os.makedirs(save_path, exist_ok=True)
+    
+    if mp == 1:
+        # Memory-efficient path for MP=1: Process files one by one
+        weight_map = {}
+        total_size = 0
+        
+        files = glob(os.path.join(hf_ckpt_path, "*.safetensors"))
+        for file_path in tqdm(files, desc="Converting files"):
+            filename = os.path.basename(file_path)
+            new_state_dict = {}
+            
+            with safe_open(file_path, framework="pt", device="cpu") as f:
+                for name in f.keys():
+                    if "model.layers.61" in name:
+                        continue
+                    
+                    param = f.get_tensor(name)
+                    # Track total size
+                    total_size += param.numel() * param.element_size()
+                    
+                    if name.startswith("model."):
+                        name = name[len("model."):]
+                    name = name.replace("self_attn", "attn")
+                    name = name.replace("mlp", "ffn")
+                    name = name.replace("weight_scale_inv", "scale")
+                    name = name.replace("e_score_correction_bias", "bias")
+                    
+                    key = name.split(".")[-2]
+                    assert key in mapping, f"Key {key} not found in mapping"
+                    new_key, _ = mapping[key]
+                    new_name = name.replace(key, new_key)
+                    
+                    new_state_dict[new_name] = param
+                    weight_map[new_name] = filename
+            
+            if new_state_dict:
+                save_file(new_state_dict, os.path.join(save_path, filename))
+                
+        # Save index file
+        index_data = {"metadata": {"total_size": total_size}, "weight_map": weight_map}
+        with open(os.path.join(save_path, "model.safetensors.index.json"), "w") as f:
+            json.dump(index_data, f, indent=4)
+            
+    else:
+        # Legacy path for MP > 1 (Needs high RAM)
+        n_local_experts = n_experts // mp
+        state_dicts = [{} for _ in range(mp)]
 
-    for i in trange(mp):
-        save_file(state_dicts[i], os.path.join(save_path, f"model{i}-mp{mp}.safetensors"))
+        for file_path in tqdm(glob(os.path.join(hf_ckpt_path, "*.safetensors"))):
+            with safe_open(file_path, framework="pt", device="cpu") as f:
+                for name in f.keys():
+                    if "model.layers.61" in name:
+                        continue
+                    param: torch.Tensor = f.get_tensor(name)
+                    if name.startswith("model."):
+                        name = name[len("model."):]
+                    name = name.replace("self_attn", "attn")
+                    name = name.replace("mlp", "ffn")
+                    name = name.replace("weight_scale_inv", "scale")
+                    name = name.replace("e_score_correction_bias", "bias")
+                    key = name.split(".")[-2]
+                    assert key in mapping, f"Key {key} not found in mapping"
+                    new_key, dim = mapping[key]
+                    name = name.replace(key, new_key)
+                    for i in range(mp):
+                        new_param = param
+                        if "experts" in name and "shared_experts" not in name:
+                            idx = int(name.split(".")[-3])
+                            if idx < i * n_local_experts or idx >= (i + 1) * n_local_experts:
+                                continue
+                        elif dim is not None:
+                            assert param.size(dim) % mp == 0, f"Dimension {dim} must be divisible by {mp}"
+                            shard_size = param.size(dim) // mp
+                            new_param = param.narrow(dim, i * shard_size, shard_size).contiguous()
+                        state_dicts[i][name] = new_param
 
+        for i in trange(mp):
+            save_file(state_dicts[i], os.path.join(save_path, f"model{i}-mp{mp}.safetensors"))
+
+    # Copy token files
     for file_path in glob(os.path.join(hf_ckpt_path, "*token*")):
         new_file_path = os.path.join(save_path, os.path.basename(file_path))
         shutil.copyfile(file_path, new_file_path)
