@@ -1,11 +1,11 @@
 #!/bin/bash --login
-#SBATCH --partition=agentS-xlong
-#SBATCH --gres=gpu:h200:4
-#SBATCH --job-name=deepseek_viz
+#SBATCH --partition=agentS-long
+#SBATCH --gres=gpu:h200:1
+#SBATCH --job-name=fred_dev
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --time=5-00:00:00
+#SBATCH --time=1-00:00:00
 
 echo "Setting up environment for DeepSeek-V3.2 Offloading..."
 
@@ -13,6 +13,8 @@ echo "Setting up environment for DeepSeek-V3.2 Offloading..."
 export OMP_NUM_THREADS=1
 # Enable the recording logic we added to model.py
 export RECORD_INDEX=1
+# Optimize PyTorch memory allocation
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Install uv (if not already installed)
 if ! command -v uv &> /dev/null
