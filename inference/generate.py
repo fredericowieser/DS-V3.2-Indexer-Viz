@@ -129,7 +129,7 @@ def main(
     print(args)
 
     # Offloading logic
-    max_memory = {i: "115GiB" for i in range(torch.cuda.device_count())}
+    max_memory = {i: "100GiB" for i in range(torch.cuda.device_count())}
     max_memory["cpu"] = "450GiB"
 
     with init_empty_weights():
@@ -149,7 +149,6 @@ def main(
         device_map="auto",
         max_memory=max_memory,
         no_split_module_classes=["Block"],
-        dtype=torch.bfloat16,
         strict=False,
         offload_folder="offload",
         offload_buffers=True,

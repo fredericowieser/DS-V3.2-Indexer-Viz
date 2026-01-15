@@ -14,7 +14,7 @@ export OMP_NUM_THREADS=1
 # Enable the recording logic we added to model.py
 export RECORD_INDEX=1
 # Optimize PyTorch memory allocation
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 # Install uv (if not already installed)
 if ! command -v uv &> /dev/null
