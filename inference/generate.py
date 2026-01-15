@@ -1,5 +1,6 @@
 import os
 import json
+import inspect
 from argparse import ArgumentParser
 from typing import List
 
@@ -88,6 +89,44 @@ def generate(
     return completion_tokens
 
 
+def _get_env_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        raise ValueError(f"Invalid int for {name}={val!r}")
+
+
+def _build_max_memory(
+    gpu_gib: int,
+    cpu_gib: int,
+    device_count: int,
+) -> dict:
+    """
+    Build a max_memory dict that works across Accelerate versions.
+    Some versions accept int GPU keys (0, 1, ...), others prefer "cuda:0".
+    We provide both to be defensive.
+    """
+    mm: dict = {"cpu": f"{cpu_gib}GiB"}
+    for i in range(device_count):
+        mm[i] = f"{gpu_gib}GiB"
+        mm[f"cuda:{i}"] = f"{gpu_gib}GiB"
+    return mm
+
+
+def _load_with_accelerate_offload(**kwargs):
+    """
+    Call load_checkpoint_and_dispatch, enabling offload_state_dict if supported.
+    This reduces peak GPU memory during load for very large checkpoints.
+    """
+    sig = inspect.signature(load_checkpoint_and_dispatch)
+    if "offload_state_dict" in sig.parameters:
+        kwargs.setdefault("offload_state_dict", True)
+    return load_checkpoint_and_dispatch(**kwargs)
+
+
 # main:
 # Entry point for the distributed generation script.
 # It initializes the distributed process group, loads model arguments and the sharded checkpoint for the local rank.
@@ -121,6 +160,10 @@ def main(
     if rank != 0:
         print = lambda *_, **__: None
     torch.cuda.set_device(local_rank)
+
+    # Some clusters still inject the deprecated env var; drop it to avoid warnings/confusion.
+    os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+
     torch.set_default_dtype(torch.bfloat16)
     torch.set_num_threads(8)
     torch.manual_seed(33377335)
@@ -129,8 +172,11 @@ def main(
     print(args)
 
     # Offloading logic
-    max_memory = {i: "100GiB" for i in range(torch.cuda.device_count())}
-    max_memory["cpu"] = "450GiB"
+    # IMPORTANT: leave headroom on the GPU; "auto" likes to pack tight and can OOM on tiny transient allocations.
+    # Tune via env vars if needed (defaults are conservative for 141GiB H200s).
+    gpu_gib = _get_env_int("DS_MAX_GPU_GIB", 110)
+    cpu_gib = _get_env_int("DS_MAX_CPU_GIB", 450)
+    max_memory = _build_max_memory(gpu_gib, cpu_gib, torch.cuda.device_count())
 
     with init_empty_weights():
         model = Transformer(args)
@@ -143,8 +189,8 @@ def main(
             set_module_tensor_to_device(model, name, "cpu", torch.zeros(buf.size(), dtype=buf.dtype))
 
     os.makedirs("offload", exist_ok=True)
-    model = load_checkpoint_and_dispatch(
-        model,
+    model = _load_with_accelerate_offload(
+        model=model,
         checkpoint=ckpt_path,
         device_map="auto",
         max_memory=max_memory,
