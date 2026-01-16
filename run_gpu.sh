@@ -5,6 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
+#SBATCH --mem=0
 #SBATCH --time=1-00:00:00
 
 echo "Setting up environment for DeepSeek-V3.2 Offloading..."
@@ -15,8 +16,8 @@ export OMP_NUM_THREADS=1
 export RECORD_INDEX=1
 # Optimize PyTorch memory allocation
 export PYTORCH_ALLOC_CONF=expandable_segments:True
-# Limit CPU memory to prevent system OOM (forces disk offload)
-export DS_MAX_CPU_GIB=200
+# Limit CPU memory (now increased since we requested full node memory)
+export DS_MAX_CPU_GIB=400
 # Safe GPU memory limit (leaves headroom for buffers)
 export DS_MAX_GPU_GIB=105
 
