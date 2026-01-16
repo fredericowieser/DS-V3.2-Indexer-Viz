@@ -2,7 +2,8 @@ import os
 import json
 import inspect
 from argparse import ArgumentParser
-from typing import List
+from copy import deepcopy
+from typing import List, Any
 
 import torch
 import torch.distributed as dist
@@ -99,20 +100,13 @@ def _get_env_int(name: str, default: int) -> int:
         raise ValueError(f"Invalid int for {name}={val!r}")
 
 
-def _build_max_memory(
-    gpu_gib: int,
-    cpu_gib: int,
-    device_count: int,
-) -> dict:
-    """
-    Build a max_memory dict that works across Accelerate versions.
-    Some versions accept int GPU keys (0, 1, ...), others prefer "cuda:0".
-    We provide both to be defensive.
-    """
+def _build_max_memory_int_keys(gpu_gib: int, cpu_gib: int, disk_gib: int, device_count: int) -> dict:
     mm: dict = {"cpu": f"{cpu_gib}GiB"}
+    # Allow Accelerate to spill to disk if needed.
+    if disk_gib > 0:
+        mm["disk"] = f"{disk_gib}GiB"
     for i in range(device_count):
         mm[i] = f"{gpu_gib}GiB"
-        mm[f"cuda:{i}"] = f"{gpu_gib}GiB"
     return mm
 
 
@@ -120,11 +114,49 @@ def _load_with_accelerate_offload(**kwargs):
     """
     Call load_checkpoint_and_dispatch, enabling offload_state_dict if supported.
     This reduces peak GPU memory during load for very large checkpoints.
+    Retries with different max_memory key formats if accelerate complains.
     """
     sig = inspect.signature(load_checkpoint_and_dispatch)
     if "offload_state_dict" in sig.parameters:
         kwargs.setdefault("offload_state_dict", True)
-    return load_checkpoint_and_dispatch(**kwargs)
+
+    # Some accelerate versions only accept integer device keys for max_memory,
+    # others accept/expect "cuda:0" strings. We'll retry with the other format.
+    try:
+        return load_checkpoint_and_dispatch(**kwargs)
+    except ValueError as e:
+        msg = str(e)
+        mm = kwargs.get("max_memory")
+        if not isinstance(mm, dict):
+            raise
+
+        # If we used cuda:* keys and this accelerate requires integers.
+        if "available devices are integers" in msg or "Device cuda:" in msg:
+            # Retry by stripping cuda:* keys and mapping them to int keys.
+            mm2: dict[str | int, Any] = {}
+            for k, v in mm.items():
+                if isinstance(k, str) and k.startswith("cuda:"):
+                    idx = int(k.split(":", 1)[1])
+                    mm2[idx] = v
+                elif k == "cpu" or k == "disk" or isinstance(k, int):
+                    mm2[k] = v
+            kwargs2 = deepcopy(kwargs)
+            kwargs2["max_memory"] = mm2
+            return load_checkpoint_and_dispatch(**kwargs2)
+
+        # If we used int keys and this accelerate doesn't recognize them (rare).
+        if "Device 0 is not recognized" in msg or "Device 1 is not recognized" in msg:
+            mm2 = {}
+            for k, v in mm.items():
+                if isinstance(k, int):
+                    mm2[f"cuda:{k}"] = v
+                elif k == "cpu" or k == "disk" or (isinstance(k, str) and k.startswith("cuda:")):
+                    mm2[k] = v
+            kwargs2 = deepcopy(kwargs)
+            kwargs2["max_memory"] = mm2
+            return load_checkpoint_and_dispatch(**kwargs2)
+
+        raise
 
 
 # main:
@@ -174,9 +206,10 @@ def main(
     # Offloading logic
     # IMPORTANT: leave headroom on the GPU; "auto" likes to pack tight and can OOM on tiny transient allocations.
     # Tune via env vars if needed (defaults are conservative for 141GiB H200s).
-    gpu_gib = _get_env_int("DS_MAX_GPU_GIB", 110)
+    gpu_gib = _get_env_int("DS_MAX_GPU_GIB", 105)
     cpu_gib = _get_env_int("DS_MAX_CPU_GIB", 450)
-    max_memory = _build_max_memory(gpu_gib, cpu_gib, torch.cuda.device_count())
+    disk_gib = _get_env_int("DS_MAX_DISK_GIB", 2000)
+    max_memory = _build_max_memory_int_keys(gpu_gib, cpu_gib, disk_gib, torch.cuda.device_count())
 
     with init_empty_weights():
         model = Transformer(args)
