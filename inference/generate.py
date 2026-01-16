@@ -4,6 +4,26 @@ import inspect
 from argparse import ArgumentParser
 from copy import deepcopy
 from typing import List, Any
+import numpy as np
+from accelerate.utils import offload
+
+# Monkeypatch accelerate to support FP8 offloading via int8 view
+_orig_offload_weight = offload.offload_weight
+_orig_load_offloaded_weight = offload.load_offloaded_weight
+
+def _patched_offload_weight(weight, name, save_folder, index=None):
+    if weight.dtype == torch.float8_e4m3fn:
+        weight = weight.view(torch.int8)
+    return _orig_offload_weight(weight, name, save_folder, index)
+
+def _patched_load_offloaded_weight(file, index=None):
+    weight = _orig_load_offloaded_weight(file, index)
+    if isinstance(weight, torch.Tensor) and weight.dtype == torch.int8:
+        return weight.view(torch.float8_e4m3fn)
+    return weight
+
+offload.offload_weight = _patched_offload_weight
+offload.load_offloaded_weight = _patched_load_offloaded_weight
 
 import torch
 import torch.distributed as dist
