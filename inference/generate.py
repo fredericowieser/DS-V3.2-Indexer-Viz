@@ -6,6 +6,7 @@ from copy import deepcopy
 from typing import List, Any
 import numpy as np
 from accelerate.utils import offload
+import accelerate.utils.modeling
 
 # Monkeypatch accelerate to support FP8 offloading via int8 view
 _orig_offload_weight = offload.offload_weight
@@ -22,8 +23,13 @@ def _patched_load_offloaded_weight(file, index=None):
         return weight.view(torch.float8_e4m3fn)
     return weight
 
+# Apply to definition
 offload.offload_weight = _patched_offload_weight
 offload.load_offloaded_weight = _patched_load_offloaded_weight
+
+# Apply to usage in modeling (CRITICAL: this is where the call comes from)
+accelerate.utils.modeling.offload_weight = _patched_offload_weight
+accelerate.utils.modeling.load_offloaded_weight = _patched_load_offloaded_weight
 
 import torch
 import torch.distributed as dist
