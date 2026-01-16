@@ -15,6 +15,10 @@ export OMP_NUM_THREADS=1
 export RECORD_INDEX=1
 # Optimize PyTorch memory allocation
 export PYTORCH_ALLOC_CONF=expandable_segments:True
+# Limit CPU memory to prevent system OOM (forces disk offload)
+export DS_MAX_CPU_GIB=200
+# Safe GPU memory limit (leaves headroom for buffers)
+export DS_MAX_GPU_GIB=105
 
 # Install uv (if not already installed)
 if ! command -v uv &> /dev/null
