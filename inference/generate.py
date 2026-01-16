@@ -102,9 +102,8 @@ def _get_env_int(name: str, default: int) -> int:
 
 def _build_max_memory_int_keys(gpu_gib: int, cpu_gib: int, disk_gib: int, device_count: int) -> dict:
     mm: dict = {"cpu": f"{cpu_gib}GiB"}
-    # Allow Accelerate to spill to disk if needed.
-    if disk_gib > 0:
-        mm["disk"] = f"{disk_gib}GiB"
+    # Note: 'disk' key causes RuntimeError in some torch versions during validation.
+    # Accelerate will automatically spill to 'offload_folder' if CPU is full.
     for i in range(device_count):
         mm[i] = f"{gpu_gib}GiB"
     return mm
