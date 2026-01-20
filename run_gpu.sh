@@ -14,6 +14,8 @@ export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH
 export CUDA_HOME=/usr/local/cuda-12.8
 # Force TileLang to use sm_90 to avoid auto-detection crash on H200 (sm_90a)
 export TILELANG_TARGET="cuda -arch=sm_90"
+# Option to disable TileLang kernels completely and fallback to PyTorch
+export DS_DEV_MODE=1
 
 echo "Setting up environment for DeepSeek-V3.2 Offloading..."
 

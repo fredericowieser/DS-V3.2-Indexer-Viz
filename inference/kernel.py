@@ -4,10 +4,114 @@ import torch.distributed as dist
 import tilelang
 import tilelang.language as T
 from typing import Tuple, Optional
-
-_TL_TARGET = os.environ.get("TILELANG_TARGET", "auto")
+import math
 
 _index_call_count = 0
+
+def _dev_mode_enabled() -> bool:
+    return os.environ.get("DS_DEV_MODE", "0") == "1" or os.environ.get("DS_DISABLE_TILELANG", "0") == "1"
+
+_FP8_MIN = -448.0
+_FP8_MAX = 448.0
+
+def _round_scale_pow2_up(scale: torch.Tensor) -> torch.Tensor:
+    """
+    Snap positive scale to the next power-of-two (>= scale).
+    Matches the spirit of the kernel's round_scale path.
+    """
+    # scale is positive
+    eps = torch.finfo(scale.dtype).tiny if scale.is_floating_point() else 1e-38
+    scale = torch.clamp(scale, min=eps)
+    return torch.pow(2.0, torch.ceil(torch.log2(scale)))
+
+def _act_quant_torch(
+    x: torch.Tensor, block_size: int = 128, round_scale: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Blockwise FP8 quantization along last dimension.
+    Returns:
+      y: float8_e4m3fn same shape as x
+      s: float32 scales shape x[..., N/block_size]
+    """
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    assert x.size(-1) % block_size == 0, "Last dim must be divisible by block_size"
+
+    N = x.size(-1)
+    g = N // block_size
+
+    x_view = x.view(*x.shape[:-1], g, block_size)  # (..., g, bs)
+    amax = x_view.abs().amax(dim=-1)               # (..., g)
+    amax = torch.clamp(amax, min=1e-4)
+
+    scale = (amax / _FP8_MAX).to(torch.float32)    # (..., g) float32
+
+    if round_scale:
+        scale = _round_scale_pow2_up(scale)
+
+    scale_expand = scale.to(x.dtype).unsqueeze(-1)  # (..., g, 1) in x dtype for division
+    y = (x_view / scale_expand).clamp(_FP8_MIN, _FP8_MAX).to(torch.float8_e4m3fn).view_as(x)
+
+    return y, scale
+
+def _dequant_fp8_activation(a_fp8: torch.Tensor, a_s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+    """
+    a_fp8: (..., K) float8
+    a_s:   (..., K/block) float32
+    Returns: (..., K) float16/bf16/float32 (torch default dtype)
+    """
+    K = a_fp8.size(-1)
+    assert K % block_size == 0
+    g = K // block_size
+    a_view = a_fp8.float().view(*a_fp8.shape[:-1], g, block_size)
+    s_view = a_s.float().view(*a_fp8.shape[:-1], g).unsqueeze(-1)
+    out = (a_view * s_view).to(torch.get_default_dtype()).view_as(a_fp8)
+    return out
+
+def _dequant_fp8_weight(b_fp8: torch.Tensor, b_s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+    """
+    b_fp8: (N, K) float8
+    b_s:   (N/block, K/block) float32
+    Returns: (N, K) dequant (torch default dtype)
+    """
+    assert b_fp8.dim() == 2
+    N, K = b_fp8.shape
+    assert N % block_size == 0 and K % block_size == 0
+
+    nb = N // block_size
+    kb = K // block_size
+
+    # (nb, bs, kb, bs) -> (nb, kb, bs, bs)
+    w = b_fp8.float().view(nb, block_size, kb, block_size).transpose(1, 2).contiguous()
+    s = b_s.float().view(nb, kb).unsqueeze(-1).unsqueeze(-1)  # (nb,kb,1,1)
+    w = (w * s).to(torch.get_default_dtype())
+    w = w.transpose(1, 2).contiguous().view(N, K)
+    return w
+
+def _fp8_index_torch(q: torch.Tensor, q_s: torch.Tensor, k: torch.Tensor, k_s: torch.Tensor) -> torch.Tensor:
+    """
+    Equivalent to the kernel:
+      logits = relu(k @ q^T) * q_s
+      sum over heads -> logits_sum
+      logits_sum *= k_s
+    Shapes:
+      q:   (b,m,h,d) float8
+      q_s: (b,m,h)   float32
+      k:   (b,n,d)   float8
+      k_s: (b,n)     float32
+    Returns:
+      (b,m,n) float32
+    """
+    qf = q.float()
+    kf = k.float()
+
+    # (b,n,d) dot (b,m,h,d) -> (b,m,n,h)
+    logits = torch.einsum("bnd,bmhd->bmnh", kf, qf)
+    logits = torch.relu(logits)
+
+    logits = logits * q_s.float().unsqueeze(2)      # (b,m,1,h)
+    out = logits.sum(dim=-1)                        # (b,m,n)
+    out = out * k_s.float().unsqueeze(1)            # (b,1,n)
+    return out
 
 
 tilelang.set_log_level("WARNING")
@@ -129,6 +233,10 @@ def act_quant(
     assert x.size(-1) % block_size == 0, (
         f"Last dimension size must be divisible by block_size (block_size={block_size})"
     )
+
+    if _dev_mode_enabled():
+        return _act_quant_torch(x, block_size=block_size, round_scale=scale_fmt is not None)
+
     N = x.size(-1)
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     s = x.new_empty(*x.size()[:-1], N // block_size, dtype=torch.float32)
@@ -221,6 +329,19 @@ def fp8_gemm(
     assert a_s.is_contiguous() and b_s.is_contiguous(), (
         "Scaling factor tensors must be contiguous"
     )
+
+    if _dev_mode_enabled():
+        # Dequant + matmul (slow but correct)
+        K = a.size(-1)
+        M = a.numel() // K
+        N = b.size(0)
+
+        a2 = _dequant_fp8_activation(a.view(M, K), a_s.view(M, -1))
+        b2 = _dequant_fp8_weight(b, b_s)
+
+        c2 = a2 @ b2.t()  # (M,N)
+        return c2.view(*a.size()[:-1], N)
+
     K = a.size(-1)
     M = a.numel() // K
     N = b.size(0)
@@ -314,7 +435,11 @@ def fp8_index(
         fp32 logits_sum * k_s (e8m0) -> fp32 index_score
     """
     global _index_call_count
-    o = fp8_index_kernel(q.shape[2], q.shape[3])(q, q_s, k, k_s)
+    
+    if _dev_mode_enabled():
+        o = _fp8_index_torch(q, q_s, k, k_s)
+    else:
+        o = fp8_index_kernel(q.shape[2], q.shape[3])(q, q_s, k, k_s)
     
     if os.environ.get("RECORD_INDEX") == "1":
         rank = dist.get_rank() if dist.is_initialized() else 0

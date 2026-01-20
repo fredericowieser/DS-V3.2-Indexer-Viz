@@ -139,6 +139,10 @@ class ParallelEmbedding(nn.Module):
         return y
 
 
+def _dev_mode_enabled() -> bool:
+    import os
+    return os.environ.get("DS_DEV_MODE", "0") == "1" or os.environ.get("DS_DISABLE_TILELANG", "0") == "1"
+
 # linear:
 # Helper function to dispatch linear operations.
 # It checks if weights are quantized (`float8_e4m3fn`). If so, it uses the custom `fp8_gemm` pipeline.
@@ -170,9 +174,14 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
 
     if weight.dtype != torch.float8_e4m3fn:
         return F.linear(x, weight)
-    else:
-        x, scale = act_quant(x, block_size, scale_fmt)
-        return fp8_gemm(x, scale, weight, weight.scale)
+    
+    # DEV MODE: dequant weights + plain F.linear (no act_quant/fp8_gemm)
+    if _dev_mode_enabled():
+        w = weight_dequant(weight, weight.scale)
+        return F.linear(x, w)
+
+    x, scale = act_quant(x, block_size, scale_fmt)
+    return fp8_gemm(x, scale, weight, weight.scale)
 
 
 class Linear(nn.Module):
