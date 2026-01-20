@@ -1,12 +1,17 @@
 #!/bin/bash --login
-#SBATCH --partition=agentS-long
-#SBATCH --gres=gpu:h200:1
+#SBATCH --partition=agentS-xlong
+#SBATCH --gres=gpu:h200:4
 #SBATCH --job-name=fred_dev
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=0
-#SBATCH --time=1-00:00:00
+#SBATCH --time=5-00:00:00
+
+# Set up CUDA environment for JIT compilation (TileLang/TVM)
+export PATH=/usr/local/cuda-12.8/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH
+export CUDA_HOME=/usr/local/cuda-12.8
 
 echo "Setting up environment for DeepSeek-V3.2 Offloading..."
 
@@ -50,21 +55,21 @@ CONFIG_PATH="inference/config_671B_v3.2.json"
 
 # A. Download Weights
 # Note: We prioritize .safetensors for use with load_checkpoint_and_dispatch
-if [ ! -d "$WEIGHTS_DIR" ] || [ -z "$(ls -A $WEIGHTS_DIR)" ]; then
-    echo "Downloading model weights..."
-    mkdir -p "$WEIGHTS_DIR"
-    huggingface-cli download "$HF_MODEL_REPO" \
-        --local-dir "$WEIGHTS_DIR" \
-        --local-dir-use-symlinks False \
-        --include "*.safetensors" "*.json"
-else
-    echo "Weights found. Skipping download."
-fi
-
-# B. Convert Weights
-# The inference code expects specific parameter names and structure that differ from the raw HF weights.
-CONVERTED_WEIGHTS_DIR="checkpoints/converted_weights"
 if [ ! -d "$CONVERTED_WEIGHTS_DIR" ] || [ -z "$(ls -A $CONVERTED_WEIGHTS_DIR)" ]; then
+    if [ ! -d "$WEIGHTS_DIR" ] || [ -z "$(ls -A $WEIGHTS_DIR)" ]; then
+        echo "Downloading model weights..."
+        mkdir -p "$WEIGHTS_DIR"
+        huggingface-cli download "$HF_MODEL_REPO" \
+            --local-dir "$WEIGHTS_DIR" \
+            --local-dir-use-symlinks False \
+            --include "*.safetensors" "*.json"
+    else
+        echo "Weights found. Skipping download."
+    fi
+
+    # B. Convert Weights
+    # The inference code expects specific parameter names and structure that differ from the raw HF weights.
+    CONVERTED_WEIGHTS_DIR="checkpoints/converted_weights"
     echo "Converting weights to local format..."
     mkdir -p "$CONVERTED_WEIGHTS_DIR"
     python inference/convert.py \
@@ -72,8 +77,12 @@ if [ ! -d "$CONVERTED_WEIGHTS_DIR" ] || [ -z "$(ls -A $CONVERTED_WEIGHTS_DIR)" ]
         --save-path "$CONVERTED_WEIGHTS_DIR" \
         --n-experts 256 \
         --model-parallel 1
+    
+    # Clean up downloaded weights after conversion
+    echo "Cleaning up downloaded weights..."
+    rm -rf "$WEIGHTS_DIR"
 else
-    echo "Converted weights found. Skipping conversion."
+    echo "Converted weights found. Skipping download and conversion."
 fi
 
 # IMPORTANT: We use 'python' NOT 'torchrun'. 
