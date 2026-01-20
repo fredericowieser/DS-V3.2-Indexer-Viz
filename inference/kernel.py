@@ -1,7 +1,13 @@
+import os
 import torch
+import torch.distributed as dist
 import tilelang
 import tilelang.language as T
 from typing import Tuple, Optional
+
+_TL_TARGET = os.environ.get("TILELANG_TARGET", "auto")
+
+_index_call_count = 0
 
 
 tilelang.set_log_level("WARNING")
@@ -49,7 +55,7 @@ def fast_round_scale(amax, fp8_max_inv):
 # Defines a TileLang JIT kernel for activation quantization that divides input `X` into blocks of `blk_m` x `group_size`.
 # It loads data to shared memory, computes the row-wise max (`amax_local`), and determines scales (`s_local`) (optionally rounding them).
 # Finally, it normalizes elements by `s_local`, clamps them to the FP8 range, and stores the quantized `Y` and scales `S`.
-@tilelang.jit(pass_configs=pass_configs)
+@tilelang.jit(pass_configs=pass_configs, target=_TL_TARGET)
 def act_quant_kernel(
     N, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32, round_scale=False
 ):
@@ -135,7 +141,7 @@ def act_quant(
 # Defines a pipelined FP8 General Matrix Multiplication (GEMM) kernel that computes C = A * B.
 # It manages shared memory loads for tiles of A, B, and their scales, fusing the scale multiplication into the accumulation loop.
 # The kernel utilizes swizzling for L2 cache efficiency and accumulates in `accum_dtype` (float32) before storing the final result.
-@tilelang.jit(pass_configs=pass_configs)
+@tilelang.jit(pass_configs=pass_configs, target=_TL_TARGET)
 def fp8_gemm_kernel(N, K, out_dtype=BF16, accum_dtype="float32"):
     assert out_dtype in [BF16, "float32"]
 
@@ -228,7 +234,7 @@ def fp8_gemm(
 # Defines a specialized kernel for computing index scores using FP8 vector-matrix operations.
 # It loads a query vector `q` and iterates over key vectors `k`, performing a GEMM to get logits.
 # It applies ReLU activation, scales the logits using `q_s` and `k_s`, and sums them to produce the final `o` scores.
-@tilelang.jit(out_idx=[4], pass_configs=pass_configs)
+@tilelang.jit(out_idx=[4], pass_configs=pass_configs, target=_TL_TARGET)
 def fp8_index_kernel(h: int, d: int):
     b = T.symbolic("b")
     m = T.symbolic("m")
@@ -307,4 +313,15 @@ def fp8_index(
         fp32 logits -> fp32 logits_sum
         fp32 logits_sum * k_s (e8m0) -> fp32 index_score
     """
-    return fp8_index_kernel(q.shape[2], q.shape[3])(q, q_s, k, k_s)
+    global _index_call_count
+    o = fp8_index_kernel(q.shape[2], q.shape[3])(q, q_s, k, k_s)
+    
+    if os.environ.get("RECORD_INDEX") == "1":
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            if _index_call_count == 0:
+                os.makedirs("logs", exist_ok=True)
+            torch.save(o.detach().cpu(), f"logs/scores_{_index_call_count}.pt")
+            _index_call_count += 1
+            
+    return o
