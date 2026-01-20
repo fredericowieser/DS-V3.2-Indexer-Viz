@@ -148,7 +148,7 @@ def _dev_mode_enabled() -> bool:
 # It checks if weights are quantized (`float8_e4m3fn`). If so, it uses the custom `fp8_gemm` pipeline.
 # Otherwise, it falls back to the standard PyTorch `F.linear`.
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None,
-           scale_fmt: Optional[str] = None) -> torch.Tensor:
+           scale: Optional[torch.Tensor] = None, scale_fmt: Optional[str] = None) -> torch.Tensor:
     """
     Applies a linear transformation to the incoming data: y = xA^T + b.
     This function supports specialized implementations based on quantization
@@ -159,6 +159,7 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
         weight (torch.Tensor): The weight tensor. It may be quantized and
             requires dequantization for certain cases.
         bias (Optional[torch.Tensor]): The bias tensor to be added. Default is None.
+        scale (Optional[torch.Tensor]): The quantization scale tensor. Default is None.
         scale_fmt (Optional[str]): The format of scaling factors.
 
     Returns:
@@ -177,11 +178,18 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
     
     # DEV MODE: dequant weights + plain F.linear (no act_quant/fp8_gemm)
     if _dev_mode_enabled():
-        w = weight_dequant(weight, weight.scale)
+        # Ensure scale is provided if weight is FP8
+        if scale is None:
+             scale = getattr(weight, "scale", None)
+        assert scale is not None, "Scale must be provided for FP8 weights"
+        
+        w = weight_dequant(weight, scale)
         return F.linear(x, w)
 
-    x, scale = act_quant(x, block_size, scale_fmt)
-    return fp8_gemm(x, scale, weight, weight.scale)
+    x, act_scale = act_quant(x, block_size, scale_fmt)
+    if scale is None:
+         scale = getattr(weight, "scale", None)
+    return fp8_gemm(x, act_scale, weight, scale)
 
 
 class Linear(nn.Module):
@@ -230,7 +238,7 @@ class Linear(nn.Module):
         Returns:
             torch.Tensor: Transformed tensor after linear computation.
         """
-        return linear(x, self.weight, self.bias, self.scale_fmt)
+        return linear(x, self.weight, self.bias, self.scale, self.scale_fmt)
 
 
 class ColumnParallelLinear(Linear):
@@ -264,7 +272,7 @@ class ColumnParallelLinear(Linear):
         Returns:
             torch.Tensor: Transformed tensor with column-parallel computation.
         """
-        y = linear(x, self.weight, self.bias, self.scale_fmt)
+        y = linear(x, self.weight, self.bias, self.scale, self.scale_fmt)
         return y
 
 
@@ -300,7 +308,7 @@ class RowParallelLinear(Linear):
         Returns:
             torch.Tensor: Transformed tensor with row-parallel computation.
         """
-        y = linear(x, self.weight, None, self.scale_fmt)
+        y = linear(x, self.weight, None, self.scale, self.scale_fmt)
         if self.reduce_output and world_size > 1:
             y = y.float()
             dist.all_reduce(y)

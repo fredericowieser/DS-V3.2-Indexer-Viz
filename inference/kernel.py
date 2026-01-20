@@ -6,6 +6,7 @@ import tilelang.language as T
 from typing import Tuple, Optional
 import math
 
+_TL_TARGET = os.environ.get("TILELANG_TARGET", "auto")
 _index_call_count = 0
 
 def _dev_mode_enabled() -> bool:
