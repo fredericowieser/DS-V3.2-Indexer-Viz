@@ -601,9 +601,12 @@ class Indexer(torch.nn.Module):
         if mask is not None:
             index_score += mask
         topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
-        topk_indices_ = topk_indices.clone()
-        dist.broadcast(topk_indices_, src=0)
-        assert torch.all(topk_indices == topk_indices_), f"{topk_indices=} {topk_indices_=}"
+        
+        if world_size > 1:
+            topk_indices_ = topk_indices.clone()
+            dist.broadcast(topk_indices_, src=0)
+            assert torch.all(topk_indices == topk_indices_), f"{topk_indices=} {topk_indices_=}"
+        
         return topk_indices
 
 
