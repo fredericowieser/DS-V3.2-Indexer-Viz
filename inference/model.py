@@ -611,12 +611,50 @@ class Indexer(torch.nn.Module):
 # Dequantizes FP8 weights to higher precision (BF16/FP32).
 # It reshapes the block-wise quantized weight and scale tensors to align dimensions.
 # Performs element-wise multiplication of the float-casted weight and scale, then restores the original shape.
-def weight_dequant(weight, scale):
-    shape = weight.shape
-    assert weight.dim() == 2
-    weight = weight.view(shape[0] // block_size, block_size, shape[1] // block_size, block_size).transpose(1, 2).contiguous().view(-1, block_size * block_size)
-    weight = (weight.float() * scale.view(-1, 1).float()).to(torch.get_default_dtype()).view(shape[0] // block_size, shape[1] // block_size, block_size, block_size).transpose(1, 2).contiguous().view(shape)
-    return weight
+# Handles dimensions that are not multiples of block_size by padding.
+def weight_dequant(weight, scale, block_size=128):
+    """
+    Robust dequantization for block-wise scaled FP8 weights.
+    Handles dimensions that are not multiples of block_size by padding.
+    """
+    N, K = weight.shape
+    # Calculate padded dimensions
+    N_padded = (N + block_size - 1) // block_size * block_size
+    K_padded = (K + block_size - 1) // block_size * block_size
+    
+    # Pad weight if necessary
+    if N != N_padded or K != K_padded:
+        # pad last dim by (0, K_diff), 2nd to last by (0, N_diff)
+        weight_padded = F.pad(weight, (0, K_padded - K, 0, N_padded - N))
+    else:
+        weight_padded = weight
+
+    # Reshape to (NB, B, KB, B)
+    # Note: scale is (NB, KB)
+    NB = N_padded // block_size
+    KB = K_padded // block_size
+    
+    # (NB, B, KB, B) -> (NB, KB, B, B) to align with scale
+    w_view = weight_padded.view(NB, block_size, KB, block_size)
+    w_permuted = w_view.permute(0, 2, 1, 3) # (NB, KB, B, B)
+    
+    # Ensure scale covers the padded dimensions (it should, as initialized)
+    # If scale is smaller (unlikely given init logic), we might crash, but let's assume it's correct.
+    scale_view = scale.view(NB, KB, 1, 1)
+    
+    # Dequantize
+    w_dequant = w_permuted.float() * scale_view.float()
+    
+    # Restore shape
+    # (NB, KB, B, B) -> (NB, B, KB, B)
+    w_restored = w_dequant.permute(0, 2, 1, 3).contiguous()
+    w_restored = w_restored.view(N_padded, K_padded)
+    
+    # Crop if necessary
+    if N != N_padded or K != K_padded:
+        w_restored = w_restored[:N, :K]
+        
+    return w_restored.to(torch.get_default_dtype())
 
 
 class MLA(nn.Module):
