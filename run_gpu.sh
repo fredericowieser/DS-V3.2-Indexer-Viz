@@ -53,23 +53,22 @@ HF_MODEL_REPO="deepseek-ai/DeepSeek-V3.2"
 WEIGHTS_DIR="checkpoints/raw_weights"
 CONFIG_PATH="inference/config_671B_v3.2.json"
 
-# A. Download Weights
-# Note: We prioritize .safetensors for use with load_checkpoint_and_dispatch
-if [ ! -d "$CONVERTED_WEIGHTS_DIR" ] || [ -z "$(ls -A $CONVERTED_WEIGHTS_DIR)" ]; then
-    if [ ! -d "$WEIGHTS_DIR" ] || [ -z "$(ls -A $WEIGHTS_DIR)" ]; then
-        echo "Downloading model weights..."
+# A. Check for converted weights (the final product we need)
+CONVERTED_WEIGHTS_DIR="checkpoints/converted_weights"
+if [ ! -d "$CONVERTED_WEIGHTS_DIR" ] || [ -z "$(ls -A "$CONVERTED_WEIGHTS_DIR")" ]; then
+    # Converted weights missing, check if raw weights exist
+    if [ ! -d "$WEIGHTS_DIR" ] || [ -z "$(ls -A "$WEIGHTS_DIR")" ]; then
+        echo "Raw weights not found. Downloading model weights..."
         mkdir -p "$WEIGHTS_DIR"
         huggingface-cli download "$HF_MODEL_REPO" \
             --local-dir "$WEIGHTS_DIR" \
             --local-dir-use-symlinks False \
             --include "*.safetensors" "*.json"
     else
-        echo "Weights found. Skipping download."
+        echo "Raw weights found. Skipping download."
     fi
-
-    # B. Convert Weights
-    # The inference code expects specific parameter names and structure that differ from the raw HF weights.
-    CONVERTED_WEIGHTS_DIR="checkpoints/converted_weights"
+    
+    # B. Convert weights
     echo "Converting weights to local format..."
     mkdir -p "$CONVERTED_WEIGHTS_DIR"
     python inference/convert.py \
@@ -77,12 +76,8 @@ if [ ! -d "$CONVERTED_WEIGHTS_DIR" ] || [ -z "$(ls -A $CONVERTED_WEIGHTS_DIR)" ]
         --save-path "$CONVERTED_WEIGHTS_DIR" \
         --n-experts 256 \
         --model-parallel 1
-    
-    # Clean up downloaded weights after conversion
-    echo "Cleaning up downloaded weights..."
-    rm -rf "$WEIGHTS_DIR"
 else
-    echo "Converted weights found. Skipping download and conversion."
+    echo "Converted weights found. Ready to run inference."
 fi
 
 # IMPORTANT: We use 'python' NOT 'torchrun'. 
