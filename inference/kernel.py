@@ -96,9 +96,9 @@ def _fp8_index_torch(q: torch.Tensor, q_s: torch.Tensor, k: torch.Tensor, k_s: t
       logits_sum *= k_s
     Shapes:
       q:   (b,m,h,d) float8
-      q_s: (b,m,h)   float32
+      q_s: (b,m,h) or (b,m,h,1) float32
       k:   (b,n,d)   float8
-      k_s: (b,n)     float32
+      k_s: (b,n) or (b,n,1)     float32
     Returns:
       (b,m,n) float32
     """
@@ -109,9 +109,23 @@ def _fp8_index_torch(q: torch.Tensor, q_s: torch.Tensor, k: torch.Tensor, k_s: t
     logits = torch.einsum("bnd,bmhd->bmnh", kf, qf)
     logits = torch.relu(logits)
 
-    logits = logits * q_s.float().unsqueeze(2)      # (b,m,1,h)
+    # Handle potentially extra singleton dim in q_s from act_quant/projection
+    if q_s.dim() == 4 and q_s.shape[-1] == 1:
+        q_s = q_s.squeeze(-1) # (b,m,h)
+
+    # logits: (b, m, n, h)
+    # q_s:    (b, m, h) -> (b, m, 1, h)
+    logits = logits * q_s.float().unsqueeze(2)      
+
     out = logits.sum(dim=-1)                        # (b,m,n)
-    out = out * k_s.float().unsqueeze(1)            # (b,1,n)
+
+    # Handle potentially extra singleton dim in k_s
+    if k_s.dim() == 3 and k_s.shape[-1] == 1:
+        k_s = k_s.squeeze(-1) # (b,n)
+
+    # out: (b, m, n)
+    # k_s: (b, n) -> (b, 1, n)
+    out = out * k_s.float().unsqueeze(1)            
     return out
 
 
