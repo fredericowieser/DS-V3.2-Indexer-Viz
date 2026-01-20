@@ -259,6 +259,18 @@ def main(
     )
 
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
+    # Fallback for missing chat template in converted weights
+    if tokenizer.chat_template is None:
+        print("Warning: No chat_template found in tokenizer config. Using default DeepSeek-style template.")
+        tokenizer.chat_template = (
+            "{% if messages[0]['role'] == 'system' %}{{ messages[0]['content'] + '\n' }}{% endif %}"
+            "{% for message in messages %}"
+            "{% if message['role'] == 'user' %}{{ 'User: ' + message['content'] + '\n\n' }}"
+            "{% elif message['role'] == 'assistant' %}{{ 'Assistant: ' + message['content'] + eos_token + '\n\n' }}"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}{{ 'Assistant: ' }}{% endif %}"
+        )
     print("I'm DeepSeek 👋")
 
     if interactive:
