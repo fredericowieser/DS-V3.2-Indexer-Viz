@@ -23,12 +23,14 @@ echo "Setting up environment for DeepSeek-V3.2 Offloading..."
 export OMP_NUM_THREADS=1
 # Enable the recording logic we added to model.py
 export RECORD_INDEX=1
+export RECORD_INDEX_OUT_DIR="logs/layer_maps"
+export RECORD_INDEX_MAX_LEN=4096 # Prevent massive files
 # Optimize PyTorch memory allocation
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 # Limit CPU memory (now increased since we requested full node memory)
-export DS_MAX_CPU_GIB=400
+export DS_MAX_CPU_GIB=250
 # Safe GPU memory limit (leaves headroom for buffers)
-export DS_MAX_GPU_GIB=105
+export DS_MAX_GPU_GIB=115
 
 # Install uv (if not already installed)
 if ! command -v uv &> /dev/null

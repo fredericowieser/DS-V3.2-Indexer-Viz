@@ -1,3 +1,5 @@
+import csv
+import os
 import math
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal
@@ -88,6 +90,87 @@ class ModelArgs:
     index_n_heads: int = 64
     index_head_dim: int = 128
     index_topk: int = 2048
+
+class IndexRecorder:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(IndexRecorder, cls).__new__(cls)
+            cls._instance.initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self.initialized: return
+        self.enabled = os.environ.get("RECORD_INDEX", "0") == "1"
+        self.out_dir = os.environ.get("RECORD_INDEX_OUT_DIR", "logs/layer_maps")
+        # Safety limit to prevent 100GB CSVs
+        self.max_seq_len = int(os.environ.get("RECORD_INDEX_MAX_LEN", "8192"))
+        self.layer_records = {} # {layer_id: matrix_cpu_float}
+        self.initialized = True
+
+    def reset(self):
+        if self.enabled:
+            self.layer_records = {}
+
+    def record(self, layer_id, score_matrix):
+        """
+        score_matrix: Tensor of shape [seq_len, seq_len] (or [seq_len, end_pos])
+        """
+        if not self.enabled: return
+        # Safety check for size
+        if score_matrix.size(0) > self.max_seq_len:
+            if layer_id == 0: # Print warning only once
+                print(f"[IndexRecorder] Skipping recording: Sequence length {score_matrix.size(0)} > limit {self.max_seq_len}")
+            return
+
+        # Move to CPU immediately to free VRAM
+        self.layer_records[layer_id] = score_matrix.detach().float().cpu()
+
+    def flush(self):
+        if not self.enabled or not self.layer_records: return
+        
+        # Distributed guard: Only Rank 0 writes
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+
+        os.makedirs(self.out_dir, exist_ok=True)
+        
+        # Iterate over captured layers
+        for layer_id, matrix in self.layer_records.items():
+            seq_len = matrix.size(0)
+            filename = f"{self.out_dir}/layer_{layer_id}_len{seq_len}.csv"
+            
+            print(f"[IndexRecorder] Writing {filename}...")
+            
+            with open(filename, 'w', newline='') as f:
+                writer = csv.writer(f)
+                
+                # Header: "query / key token positions", "0", "1", ...
+                header = ["query / key token positions"] + [str(k) for k in range(seq_len)]
+                writer.writerow(header)
+                
+                # Rows
+                # matrix is [rows(queries), cols(keys)]
+                # It is likely a lower triangular matrix if masked properly
+                matrix_list = matrix.tolist()
+                
+                for q_idx, row_values in enumerate(matrix_list):
+                    csv_row = [str(q_idx)]
+                    for k_idx, val in enumerate(row_values):
+                        # Handle masking: if val is -inf, leave blank
+                        if k_idx > q_idx: # Enforce visual causality for clarity
+                            csv_row.append("")
+                        elif val == float('-inf'):
+                            csv_row.append("")
+                        else:
+                            csv_row.append(f"{val:.4f}")
+                    writer.writerow(csv_row)
+        
+        print("[IndexRecorder] All layers written.")
+
+# Global Instance
+recorder = IndexRecorder()
 
 class ParallelEmbedding(nn.Module):
     """
@@ -576,7 +659,7 @@ class Indexer(torch.nn.Module):
     # Computes the top-k expert indices for the current step.
     # It projects inputs to Q and K, applies RoPE and rotation, quantizes K, and updates the KV cache.
     # Then it computes attention scores between Q and cached K (using `fp8_index`) to determine the most relevant experts.
-    def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
+    def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor], layer_id: int = -1):
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
         q = self.wq_b(qr)
@@ -602,6 +685,14 @@ class Indexer(torch.nn.Module):
         index_score = fp8_index(q_fp8.contiguous(), weights, self.k_cache[:bsz, :end_pos].contiguous(), self.k_scale_cache[:bsz, :end_pos].contiguous())
         if mask is not None:
             index_score += mask
+
+        # NEW: Recording Logic
+        if recorder.enabled and layer_id != -1 and start_pos == 0:
+            # We only record during PREFILL (start_pos == 0) to get the full causal map.
+            # index_score shape is [bsz, seq_len, seq_len]
+            # Take batch 0
+            recorder.record(layer_id, index_score[0])
+
         topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
         
         if world_size > 1:
@@ -756,7 +847,7 @@ class MLA(nn.Module):
             scores = torch.einsum("bshd,bthd->bsht", q, k).mul_(self.softmax_scale)
 
             # indexer
-            topk_indices = self.indexer(x, qr, start_pos, freqs_cis, mask)
+            topk_indices = self.indexer(x, qr, start_pos, freqs_cis, mask, layer_id=getattr(self, 'layer_id', -1))
             index_mask = torch.full((bsz, seqlen, seqlen), float("-inf"), device=x.device).scatter_(-1, topk_indices, 0)
             index_mask += mask
             scores += index_mask.unsqueeze(2)
@@ -777,7 +868,7 @@ class MLA(nn.Module):
                       torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
 
             # indexer
-            topk_indices = self.indexer(x, qr, start_pos, freqs_cis, mask)
+            topk_indices = self.indexer(x, qr, start_pos, freqs_cis, mask, layer_id=getattr(self, 'layer_id', -1))
             index_mask = torch.full((bsz, 1, end_pos), float("-inf"), device=x.device).scatter_(-1, topk_indices, 0)
             scores += index_mask.unsqueeze(2)
 
@@ -1043,6 +1134,7 @@ class Block(nn.Module):
         """
         super().__init__()
         self.attn = MLA(args)
+        self.attn.layer_id = layer_id
         self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args)
         self.attn_norm = RMSNorm(args.dim)
         self.ffn_norm = RMSNorm(args.dim)
@@ -1130,6 +1222,9 @@ class Transformer(nn.Module):
         Returns:
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
         """
+        if start_pos == 0: # Only reset on prefill start
+            recorder.reset()
+
         seqlen = tokens.size(1)
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
         mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1) if seqlen > 1 else None
@@ -1142,6 +1237,10 @@ class Transformer(nn.Module):
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)
             logits = torch.cat(all_logits, dim=-1)
+        
+        if start_pos == 0: # Only flush after prefill completes
+            recorder.flush()
+            
         return logits
 
 
