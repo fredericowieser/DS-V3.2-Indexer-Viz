@@ -40,6 +40,49 @@ from accelerate.utils import set_module_tensor_to_device
 from model import Transformer, ModelArgs, precompute_freqs_cis
 
 
+def _default_system_prompt() -> str:
+    # Highest priority: explicit prompt override
+    sp = os.getenv("DS_SYSTEM_PROMPT")
+    if sp and sp.strip():
+        return sp.strip()
+
+    lang = os.getenv("DS_LANG", "en").strip().lower()
+    if lang in {"en", "english"}:
+        return (
+            "You are a helpful assistant. "
+            "Respond in English unless the user explicitly asks you to use another language. "
+            "If the user writes in another language but asks for English, respond in English."
+        )
+    if lang in {"zh", "zh-cn", "zh-hans", "chinese"}:
+        return (
+            "你是一个有帮助的助手。"
+            "除非用户明确要求切换语言，否则请始终用中文回答。"
+        )
+    # Fallback: be explicit but neutral
+    return (
+        f"You are a helpful assistant. Respond in {lang} unless the user explicitly asks otherwise."
+    )
+
+
+def _init_messages_with_system() -> List[dict]:
+    return [{"role": "system", "content": _default_system_prompt()}]
+
+
+def _set_language_system_message(messages: List[dict], lang: str) -> None:
+    os.environ["DS_LANG"] = lang
+    sys_msg = {"role": "system", "content": _default_system_prompt()}
+    if messages and messages[0].get("role") == "system":
+        messages[0] = sys_msg
+    else:
+        messages.insert(0, sys_msg)
+
+
+def _endswith(seq: List[int], suffix: List[int]) -> bool:
+    if len(suffix) == 0 or len(seq) < len(suffix):
+        return False
+    return seq[-len(suffix):] == suffix
+
+
 # sample:
 # Samples a single token from the probability distribution derived from logits.
 # It applies temperature scaling to smooth or sharpen the distribution.
@@ -71,7 +114,8 @@ def generate(
     prompt_tokens: List[List[int]],
     max_new_tokens: int,
     eos_id: int,
-    temperature: float = 1.0
+    temperature: float = 1.0,
+    stop_token_seqs: List[List[int]] | None = None,
 ) -> List[List[int]]:
     """
     Generates new tokens based on the given prompt tokens using the specified model.
@@ -82,6 +126,7 @@ def generate(
         max_new_tokens (int): The maximum number of new tokens to generate.
         eos_id (int): The end-of-sequence token ID.
         temperature (float, optional): The temperature value for sampling. Defaults to 1.0.
+        stop_token_seqs (List[List[int]] | None, optional): List of token sequences that stop generation. Defaults to None.
 
     Returns:
         List[List[int]]: A list of lists containing the generated tokens for each sequence.
@@ -92,27 +137,64 @@ def generate(
     tokens = torch.full((len(prompt_tokens), total_len), -1, dtype=torch.long, device="cuda")
     for i, t in enumerate(prompt_tokens):
         tokens[i, :len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+
     prev_pos = 0
     finished = torch.tensor([False] * len(prompt_tokens), device="cuda")
     prompt_mask = tokens != -1
+
+    # Track generated tokens per sequence to do suffix checks without decoding
+    generated: List[List[int]] = [[] for _ in range(len(prompt_tokens))]
+    stop_token_seqs = stop_token_seqs or []
+
     for cur_pos in range(min(prompt_lens), total_len):
         logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
         if temperature > 0:
             next_token = sample(logits, temperature)
         else:
             next_token = logits.argmax(dim=-1)
+
+        # Respect prompt tokens where prompt_mask is True
         next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
         tokens[:, cur_pos] = next_token
-        finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
+
+        # Update per-sample generated lists & stop conditions
+        for i in range(len(prompt_tokens)):
+            if finished[i].item():
+                continue
+            if prompt_mask[i, cur_pos].item():
+                # Still inside the original prompt; don't treat as generated
+                continue
+
+            tok = int(next_token[i].item())
+            generated[i].append(tok)
+
+            # EOS stop
+            if tok == eos_id:
+                finished[i] = True
+                continue
+
+            # Stop-sequence stop (e.g. "\n\nUser:")
+            if stop_token_seqs:
+                for stop_seq in stop_token_seqs:
+                    if _endswith(generated[i], stop_seq):
+                        # Mark finished and remove the stop sequence from the output
+                        finished[i] = True
+                        del generated[i][-len(stop_seq):]
+                        break
+
         prev_pos = cur_pos
         if finished.all():
             break
-    completion_tokens = []
-    for i, toks in enumerate(tokens.tolist()):
-        toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]
-        if eos_id in toks:
-            toks = toks[:toks.index(eos_id)]
-        completion_tokens.append(toks)
+
+    # Return generated (already stripped prompt + stop seq), clipped to max_new_tokens
+    completion_tokens: List[List[int]] = []
+    for i in range(len(prompt_tokens)):
+        out = generated[i][:max_new_tokens]
+        # If EOS somehow included (should be stripped by logic above, but double check), strip it
+        if eos_id in out:
+            out = out[:out.index(eos_id)]
+        completion_tokens.append(out)
+
     return completion_tokens
 
 
@@ -274,7 +356,11 @@ def main(
     print("I'm DeepSeek 👋")
 
     if interactive:
-        messages = []
+        # Precompute stop sequences for "User:" turns
+        stop_strs = ["\n\nUser:", "\nUser:"]
+        stop_token_seqs = [tokenizer.encode(s, add_special_tokens=False) for s in stop_strs]
+        
+        messages = _init_messages_with_system()
         while True:
             if world_size == 1:
                 prompt = input(">>> ")
@@ -286,15 +372,40 @@ def main(
                 objects = [None]
                 dist.broadcast_object_list(objects, 0)
                 prompt = objects[0]
+            
             if prompt == "/exit":
                 break
             elif prompt == "/clear":
-                messages.clear()
+                messages = _init_messages_with_system()
                 continue
+            elif prompt.startswith("/lang "):
+                # Usage: /lang en  OR  /lang zh
+                _, _, new_lang = prompt.partition(" ")
+                new_lang = new_lang.strip()
+                if not new_lang:
+                    print("Usage: /lang en|zh|...")
+                    continue
+                _set_language_system_message(messages, new_lang)
+                print(f"(system) Language set to: {new_lang}")
+                continue
+
             messages.append({"role": "user", "content": prompt})
             prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
-            completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
+            completion_tokens = generate(
+                model, 
+                [prompt_tokens], 
+                max_new_tokens, 
+                tokenizer.eos_token_id, 
+                temperature,
+                stop_token_seqs=stop_token_seqs
+            )
             completion = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
+            
+            # Extra safety: strip trailing "User:" if it leaked through
+            for cut in stop_strs:
+                if cut in completion:
+                    completion = completion.split(cut, 1)[0].rstrip()
+            
             print(completion)
             messages.append({"role": "assistant", "content": completion})
     else:
