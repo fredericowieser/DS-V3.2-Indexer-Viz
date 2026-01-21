@@ -174,6 +174,8 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
     assert bias is None
 
     if weight.dtype != torch.float8_e4m3fn:
+        if x.dtype != weight.dtype:
+            x = x.to(weight.dtype)
         return F.linear(x, weight)
     
     # DEV MODE: dequant weights + plain F.linear (no act_quant/fp8_gemm)
