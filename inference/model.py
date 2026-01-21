@@ -764,6 +764,10 @@ class MLA(nn.Module):
             scores = scores.softmax(dim=-1)
             x = torch.einsum("bsht,bthd->bshd", scores, v)
         else:                   # MQA decode
+            # Manually trigger accelerate hook to load weights if needed
+            if hasattr(self.wkv_b, "_hf_hook"):
+                 self.wkv_b._hf_hook.pre_forward(self.wkv_b)
+
             if self.dequant_wkv_b is None and self.wkv_b.scale is not None:
                 self.dequant_wkv_b = weight_dequant(self.wkv_b.weight, self.wkv_b.scale)
             wkv_b = self.wkv_b.weight if self.dequant_wkv_b is None else self.dequant_wkv_b
@@ -780,6 +784,10 @@ class MLA(nn.Module):
             scores = scores.softmax(dim=-1)
             x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
             x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
+            
+            # Manually trigger post-forward to release memory if needed
+            if hasattr(self.wkv_b, "_hf_hook"):
+                 self.wkv_b._hf_hook.post_forward(self.wkv_b, torch.tensor([]))
         x = self.wo(x.flatten(2))
         return x
 
