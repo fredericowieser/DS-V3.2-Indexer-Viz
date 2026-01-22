@@ -872,14 +872,14 @@ class MLA(nn.Module):
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pe_raw = k_pe # Keep reference to raw k_pe
+        k_pe_raw = k_pe # Keep reference to raw k_pe (3D: [bsz, seqlen, rope_dim])
         kv = self.kv_norm(kv)
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis).squeeze(2) # Modified k_pe (rotated)
+        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis) # k_pe becomes 4D: [bsz, seqlen, 1, rope_dim]
         # we use fp8 kv cache in actual deployment, so here we simulate the precision by casting kv to fp8 and then back to bf16.
         kv_fp8, kv_scale = act_quant(kv, block_size, self.scale_fmt)
         kv = (kv_fp8.view(-1, block_size).float() * kv_scale.view(-1, 1)).to(kv.dtype).view_as(kv)
         self.kv_cache[:bsz, start_pos:end_pos] = kv
-        self.pe_cache[:bsz, start_pos:end_pos] = k_pe
+        self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
         if mask is not None:    # MHA prefill
             q = torch.cat([q_nope, q_pe], dim=-1)
 
