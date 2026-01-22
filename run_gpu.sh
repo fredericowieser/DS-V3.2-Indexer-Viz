@@ -21,10 +21,10 @@ echo "Setting up environment for DeepSeek-V3.2 Offloading..."
 
 # We set this to 1 to prevent MKL/OpenMP contention with PyTorch
 export OMP_NUM_THREADS=1
-# Enable the recording logic we added to model.py
-export RECORD_INDEX=1
-export RECORD_INDEX_OUT_DIR="logs/layer_maps"
-export RECORD_INDEX_MAX_LEN=4096 # Prevent massive files
+# Enable Recording
+export RECORD_VECTORS=1
+export RECORD_SCORES=1
+export RECORD_OUT_DIR="logs/vectors_and_scores"
 # Optimize PyTorch memory allocation
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 # Limit CPU memory (now increased since we requested full node memory)

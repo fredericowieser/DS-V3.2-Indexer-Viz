@@ -91,86 +91,102 @@ class ModelArgs:
     index_head_dim: int = 128
     index_topk: int = 2048
 
-class IndexRecorder:
+class Recorder:
     _instance = None
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super(IndexRecorder, cls).__new__(cls)
+            cls._instance = super(Recorder, cls).__new__(cls)
             cls._instance.initialized = False
         return cls._instance
 
     def __init__(self):
         if self.initialized: return
-        self.enabled = os.environ.get("RECORD_INDEX", "0") == "1"
-        self.out_dir = os.environ.get("RECORD_INDEX_OUT_DIR", "logs/layer_maps")
-        # Safety limit to prevent 100GB CSVs
-        self.max_seq_len = int(os.environ.get("RECORD_INDEX_MAX_LEN", "8192"))
-        self.layer_records = {} # {layer_id: matrix_cpu_float}
+        self.record_vectors = os.environ.get("RECORD_VECTORS", "0") == "1"
+        self.record_scores = os.environ.get("RECORD_SCORES", "0") == "1"
+        self.enabled = self.record_vectors or self.record_scores
+        
+        self.out_dir = os.environ.get("RECORD_OUT_DIR", "logs/debug_output")
+        
+        # self.vectors[layer_id][type][head_id] = tensor
+        self.vectors = {} 
+        # self.matrices[layer_id][type] = tensor
+        self.matrices = {}
+        
         self.initialized = True
 
     def reset(self):
         if self.enabled:
-            self.layer_records = {}
+            self.vectors = {}
+            self.matrices = {}
 
-    def record(self, layer_id, score_matrix):
-        """
-        score_matrix: Tensor of shape [seq_len, seq_len] (or [seq_len, end_pos])
-        """
-        if not self.enabled: return
-        # Safety check for size
-        if score_matrix.size(0) > self.max_seq_len:
-            if layer_id == 0: # Print warning only once
-                print(f"[IndexRecorder] Skipping recording: Sequence length {score_matrix.size(0)} > limit {self.max_seq_len}")
-            return
+    def save_vector(self, layer_id, v_type, head_id, tensor):
+        if not self.record_vectors: return
+        if layer_id not in self.vectors: self.vectors[layer_id] = {}
+        if v_type not in self.vectors[layer_id]: self.vectors[layer_id][v_type] = {}
+        self.vectors[layer_id][v_type][head_id] = tensor.detach().float().cpu()
 
-        # Move to CPU immediately to free VRAM
-        self.layer_records[layer_id] = score_matrix.detach().float().cpu()
+    def save_matrix(self, layer_id, m_type, tensor):
+        if not self.record_scores: return
+        if layer_id not in self.matrices: self.matrices[layer_id] = {}
+        self.matrices[layer_id][m_type] = tensor.detach().float().cpu()
 
     def flush(self):
-        if not self.enabled or not self.layer_records: return
-        
+        if not self.enabled: return
         # Distributed guard: Only Rank 0 writes
         if dist.is_initialized() and dist.get_rank() != 0:
             return
 
+        if not self.vectors and not self.matrices: return
+
         os.makedirs(self.out_dir, exist_ok=True)
-        
-        # Iterate over captured layers
-        for layer_id, matrix in self.layer_records.items():
-            seq_len = matrix.size(0)
-            filename = f"{self.out_dir}/layer_{layer_id}_len{seq_len}.csv"
-            
-            print(f"[IndexRecorder] Writing {filename}...")
-            
-            with open(filename, 'w', newline='') as f:
-                writer = csv.writer(f)
+        print(f"[Recorder] Flushing data to {self.out_dir}...")
+
+        # 1. Write Vectors
+        for layer_id, types in self.vectors.items():
+            for v_type, heads in types.items():
+                for head_id, tensor in heads.items():
+                    # filename: layer_{L}_{type}_h_{H}.csv
+                    filename = f"layer_{layer_id}_{v_type}_h_{head_id}.csv"
+                    filepath = os.path.join(self.out_dir, filename)
+                    
+                    seq_len, dim = tensor.shape
+                    with open(filepath, 'w', newline='') as f:
+                        writer = csv.writer(f)
+                        header = ["token position \\ hidden dim"] + [f"d{i}" for i in range(dim)]
+                        writer.writerow(header)
+                        for i, row_vals in enumerate(tensor.tolist()):
+                            row = [str(i)] + [f"{x:.6f}" for x in row_vals]
+                            writer.writerow(row)
+
+        # 2. Write Matrices
+        for layer_id, types in self.matrices.items():
+            for m_type, tensor in types.items():
+                # filename: layer_{L}_{type}.csv
+                filename = f"layer_{layer_id}_{m_type}.csv"
+                filepath = os.path.join(self.out_dir, filename)
                 
-                # Header: "query / key token positions", "0", "1", ...
-                header = ["query / key token positions"] + [str(k) for k in range(seq_len)]
-                writer.writerow(header)
-                
-                # Rows
-                # matrix is [rows(queries), cols(keys)]
-                # It is likely a lower triangular matrix if masked properly
-                matrix_list = matrix.tolist()
-                
-                for q_idx, row_values in enumerate(matrix_list):
-                    csv_row = [str(q_idx)]
-                    for k_idx, val in enumerate(row_values):
-                        # Handle masking: if val is -inf, leave blank
-                        if k_idx > q_idx: # Enforce visual causality for clarity
-                            csv_row.append("")
-                        elif val == float('-inf'):
-                            csv_row.append("")
-                        else:
-                            csv_row.append(f"{val:.4f}")
-                    writer.writerow(csv_row)
-        
-        print("[IndexRecorder] All layers written.")
+                # tensor shape: [seq_len, seq_len] (or similar)
+                seq_len = tensor.size(0)
+                with open(filepath, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    header = ["row \\ col"] + [str(k) for k in range(tensor.size(1))]
+                    writer.writerow(header)
+                    
+                    matrix_list = tensor.tolist()
+                    for q_idx, row_values in enumerate(matrix_list):
+                        csv_row = [str(q_idx)]
+                        for val in row_values:
+                            if val == float('-inf'):
+                                csv_row.append("")
+                            else:
+                                csv_row.append(f"{val:.4f}")
+                        writer.writerow(csv_row)
+
+        print("[Recorder] Flush complete.")
 
 # Global Instance
-recorder = IndexRecorder()
+recorder = Recorder()
 
 class ParallelEmbedding(nn.Module):
     """
@@ -664,11 +680,25 @@ class Indexer(torch.nn.Module):
         end_pos = start_pos + seqlen
         q = self.wq_b(qr)
         q = q.view(bsz, seqlen, self.n_heads, self.head_dim)
+
+        # NEW: Record Indexer Queries
+        if recorder.record_vectors and layer_id != -1:
+             # q: [bsz, seqlen, n_heads, head_dim] -> take batch 0
+             q_cpu = q[0].detach().float().cpu() # [seqlen, n_heads, head_dim]
+             for h in range(self.n_heads):
+                 recorder.save_vector(layer_id, "queries_index", h, q_cpu[:, h, :])
+
         q_pe, q_nope = torch.split(q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
         # rope in indexer is not interleaved
         q_pe = apply_rotary_emb(q_pe, freqs_cis, False)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = self.wk(x)
+
+        # NEW: Record Indexer Keys
+        if recorder.record_vectors and layer_id != -1:
+             # k: [bsz, seqlen, head_dim] -> take batch 0. Shared key, record as head 0.
+             recorder.save_vector(layer_id, "keys_index", 0, k[0])
+
         k = self.k_norm(k)
         k_pe, k_nope = torch.split(k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
         # rope in indexer is not interleaved
@@ -686,12 +716,9 @@ class Indexer(torch.nn.Module):
         if mask is not None:
             index_score += mask
 
-        # NEW: Recording Logic
-        if recorder.enabled and layer_id != -1 and start_pos == 0:
-            # We only record during PREFILL (start_pos == 0) to get the full causal map.
-            # index_score shape is [bsz, seq_len, seq_len]
-            # Take batch 0
-            recorder.record(layer_id, index_score[0])
+        # NEW: Record Indexer Activations (Matrix)
+        if recorder.record_scores and layer_id != -1 and start_pos == 0:
+            recorder.save_matrix(layer_id, "activations_index", index_score[0])
 
         topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
         
@@ -840,10 +867,25 @@ class MLA(nn.Module):
         self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
         if mask is not None:    # MHA prefill
             q = torch.cat([q_nope, q_pe], dim=-1)
+
+            # NEW: Record MLA Queries
+            layer_id = getattr(self, 'layer_id', -1)
+            if recorder.record_vectors and layer_id != -1:
+                q_cpu = q[0].detach().float().cpu() # [seqlen, n_local_heads, qk_head_dim]
+                for h in range(self.n_local_heads):
+                    recorder.save_vector(layer_id, "queries_attn", h, q_cpu[:, h, :])
+
             kv = self.wkv_b(kv)
             kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+
+            # NEW: Record MLA Keys
+            if recorder.record_vectors and layer_id != -1:
+                k_cpu = k[0].detach().float().cpu()
+                for h in range(self.n_local_heads):
+                    recorder.save_vector(layer_id, "keys_attn", h, k_cpu[:, h, :])
+
             scores = torch.einsum("bshd,bthd->bsht", q, k).mul_(self.softmax_scale)
 
             # indexer

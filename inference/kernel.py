@@ -7,7 +7,6 @@ from typing import Tuple, Optional
 import math
 
 _TL_TARGET = os.environ.get("TILELANG_TARGET", "auto")
-_index_call_count = 0
 
 def _dev_mode_enabled() -> bool:
     return os.environ.get("DS_DEV_MODE", "0") == "1" or os.environ.get("DS_DISABLE_TILELANG", "0") == "1"
@@ -448,20 +447,9 @@ def fp8_index(
         relu(fp32 logits) * q_s (weights) -> fp32 logits
         fp32 logits -> fp32 logits_sum
         fp32 logits_sum * k_s (e8m0) -> fp32 index_score
-    """
-    global _index_call_count
-    
+    """    
     if _dev_mode_enabled():
         o = _fp8_index_torch(q, q_s, k, k_s)
     else:
         o = fp8_index_kernel(q.shape[2], q.shape[3])(q, q_s, k, k_s)
-    
-    if os.environ.get("RECORD_INDEX") == "1":
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        if rank == 0:
-            if _index_call_count == 0:
-                os.makedirs("logs", exist_ok=True)
-            torch.save(o.detach().cpu(), f"logs/scores_{_index_call_count}.pt")
-            _index_call_count += 1
-            
     return o
