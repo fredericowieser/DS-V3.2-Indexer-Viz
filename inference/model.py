@@ -680,26 +680,32 @@ class Indexer(torch.nn.Module):
         end_pos = start_pos + seqlen
         q = self.wq_b(qr)
         q = q.view(bsz, seqlen, self.n_heads, self.head_dim)
+
+        # NEW: Record Indexer Queries (Raw, before RoPE)
+        if recorder.record_vectors and layer_id != -1 and start_pos == 0:
+             q_cpu = q[0].detach().float().cpu() 
+             for h in range(self.n_heads):
+                 recorder.save_vector(layer_id, "queries_index", h, q_cpu[:, h, :])
+
         q_pe, q_nope = torch.split(q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
         # rope in indexer is not interleaved
         q_pe = apply_rotary_emb(q_pe, freqs_cis, False)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = self.wk(x)
         k = self.k_norm(k)
+
+        # NEW: Record Indexer Keys (After Norm, before RoPE)
+        if recorder.record_vectors and layer_id != -1 and start_pos == 0:
+             k_cpu = k[0].detach().float().cpu()
+             for h in range(self.n_heads):
+                 recorder.save_vector(layer_id, "keys_index", h, k_cpu)
+
         k_pe, k_nope = torch.split(k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
         # rope in indexer is not interleaved
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis, False).squeeze(2)
         k = torch.cat([k_pe, k_nope], dim=-1)
         q = rotate_activation(q)
         k = rotate_activation(k)
-
-        # NEW: Record Indexer Queries & Keys (Prefill only)
-        if recorder.record_vectors and layer_id != -1 and start_pos == 0:
-             q_cpu = q[0].detach().float().cpu() 
-             k_cpu = k[0].detach().float().cpu()
-             for h in range(self.n_heads):
-                 recorder.save_vector(layer_id, "queries_index", h, q_cpu[:, h, :])
-                 recorder.save_vector(layer_id, "keys_index", h, k_cpu)
 
         q_fp8, q_scale = act_quant(q, block_size, self.scale_fmt)
         k_fp8, k_scale = act_quant(k, block_size, self.scale_fmt)
@@ -854,35 +860,39 @@ class MLA(nn.Module):
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr)
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
+
+        # NEW: Record MLA Queries (Raw, before RoPE)
+        layer_id = getattr(self, 'layer_id', -1)
+        if recorder.record_vectors and layer_id != -1 and start_pos == 0:
+            q_cpu = q[0].detach().float().cpu() # [seqlen, n_local_heads, qk_head_dim]
+            for h in range(self.n_local_heads):
+                recorder.save_vector(layer_id, "queries_attn", h, q_cpu[:, h, :])
+
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        k_pe_raw = k_pe # Keep reference to raw k_pe
         kv = self.kv_norm(kv)
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
+        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis).squeeze(2) # Modified k_pe (rotated)
         # we use fp8 kv cache in actual deployment, so here we simulate the precision by casting kv to fp8 and then back to bf16.
         kv_fp8, kv_scale = act_quant(kv, block_size, self.scale_fmt)
         kv = (kv_fp8.view(-1, block_size).float() * kv_scale.view(-1, 1)).to(kv.dtype).view_as(kv)
         self.kv_cache[:bsz, start_pos:end_pos] = kv
-        self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+        self.pe_cache[:bsz, start_pos:end_pos] = k_pe
         if mask is not None:    # MHA prefill
             q = torch.cat([q_nope, q_pe], dim=-1)
-
-            # NEW: Record MLA Queries
-            layer_id = getattr(self, 'layer_id', -1)
-            if recorder.record_vectors and layer_id != -1:
-                q_cpu = q[0].detach().float().cpu() # [seqlen, n_local_heads, qk_head_dim]
-                for h in range(self.n_local_heads):
-                    recorder.save_vector(layer_id, "queries_attn", h, q_cpu[:, h, :])
 
             kv = self.wkv_b(kv)
             kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
 
-            # NEW: Record MLA Keys
-            if recorder.record_vectors and layer_id != -1:
-                k_cpu = k[0].detach().float().cpu()
+            # NEW: Record MLA Keys (Raw, before RoPE)
+            # Reconstruct raw K using k_pe_raw
+            if recorder.record_vectors and layer_id != -1 and start_pos == 0:
+                k_raw = torch.cat([k_nope, k_pe_raw.unsqueeze(2).expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+                k_cpu = k_raw[0].detach().float().cpu()
                 for h in range(self.n_local_heads):
                     recorder.save_vector(layer_id, "keys_attn", h, k_cpu[:, h, :])
 
