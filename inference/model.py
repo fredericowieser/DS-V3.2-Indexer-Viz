@@ -680,25 +680,11 @@ class Indexer(torch.nn.Module):
         end_pos = start_pos + seqlen
         q = self.wq_b(qr)
         q = q.view(bsz, seqlen, self.n_heads, self.head_dim)
-
-        # NEW: Record Indexer Queries
-        if recorder.record_vectors and layer_id != -1:
-             # q: [bsz, seqlen, n_heads, head_dim] -> take batch 0
-             q_cpu = q[0].detach().float().cpu() # [seqlen, n_heads, head_dim]
-             for h in range(self.n_heads):
-                 recorder.save_vector(layer_id, "queries_index", h, q_cpu[:, h, :])
-
         q_pe, q_nope = torch.split(q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
         # rope in indexer is not interleaved
         q_pe = apply_rotary_emb(q_pe, freqs_cis, False)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = self.wk(x)
-
-        # NEW: Record Indexer Keys
-        if recorder.record_vectors and layer_id != -1:
-             # k: [bsz, seqlen, head_dim] -> take batch 0. Shared key, record as head 0.
-             recorder.save_vector(layer_id, "keys_index", 0, k[0])
-
         k = self.k_norm(k)
         k_pe, k_nope = torch.split(k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
         # rope in indexer is not interleaved
@@ -706,11 +692,25 @@ class Indexer(torch.nn.Module):
         k = torch.cat([k_pe, k_nope], dim=-1)
         q = rotate_activation(q)
         k = rotate_activation(k)
+
+        # NEW: Record Indexer Queries & Keys (Prefill only)
+        if recorder.record_vectors and layer_id != -1 and start_pos == 0:
+             q_cpu = q[0].detach().float().cpu() 
+             k_cpu = k[0].detach().float().cpu()
+             for h in range(self.n_heads):
+                 recorder.save_vector(layer_id, "queries_index", h, q_cpu[:, h, :])
+                 recorder.save_vector(layer_id, "keys_index", h, k_cpu)
+
         q_fp8, q_scale = act_quant(q, block_size, self.scale_fmt)
         k_fp8, k_scale = act_quant(k, block_size, self.scale_fmt)
         self.k_cache[:bsz, start_pos:end_pos] = k_fp8
         self.k_scale_cache[:bsz, start_pos:end_pos] = k_scale
         weights = self.weights_proj(x.float()) * self.n_heads ** -0.5
+
+        # NEW: Record Indexer Weights (Gate) (Prefill only)
+        if recorder.record_scores and layer_id != -1 and start_pos == 0:
+             recorder.save_matrix(layer_id, "weights_index", weights[0])
+
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         index_score = fp8_index(q_fp8.contiguous(), weights, self.k_cache[:bsz, :end_pos].contiguous(), self.k_scale_cache[:bsz, :end_pos].contiguous())
         if mask is not None:
