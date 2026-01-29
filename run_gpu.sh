@@ -67,10 +67,10 @@ if [ ! -d "$CONVERTED_WEIGHTS_DIR" ] || [ -z "$(find "$CONVERTED_WEIGHTS_DIR" -m
     if [ ! -d "$WEIGHTS_DIR" ] || [ -z "$(find "$WEIGHTS_DIR" -maxdepth 1 -name "*.safetensors" -print -quit)" ]; then
         echo "Raw weights not found. Downloading model weights..."
         mkdir -p "$WEIGHTS_DIR"
-        huggingface-cli download "$HF_MODEL_REPO" \
+        python -m huggingface_hub.cli download "$HF_MODEL_REPO" \
             --local-dir "$WEIGHTS_DIR" \
             --local-dir-use-symlinks False \
-            --include "*.safetensors" "*.json"
+            --include "*.safetensors" "*.json" || { echo "Download failed"; exit 1; }
     else
         echo "Raw weights found. Skipping download."
     fi
