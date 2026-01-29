@@ -61,9 +61,10 @@ CONFIG_PATH="inference/config_671B_v3.2.json"
 
 # A. Check for converted weights (the final product we need)
 CONVERTED_WEIGHTS_DIR="checkpoints/converted_weights"
-if [ ! -d "$CONVERTED_WEIGHTS_DIR" ] || [ -z "$(ls -A "$CONVERTED_WEIGHTS_DIR")" ]; then
+# Check if directory exists and contains at least one .safetensors file
+if [ ! -d "$CONVERTED_WEIGHTS_DIR" ] || [ -z "$(find "$CONVERTED_WEIGHTS_DIR" -maxdepth 1 -name "*.safetensors" -print -quit)" ]; then
     # Converted weights missing, check if raw weights exist
-    if [ ! -d "$WEIGHTS_DIR" ] || [ -z "$(ls -A "$WEIGHTS_DIR")" ]; then
+    if [ ! -d "$WEIGHTS_DIR" ] || [ -z "$(find "$WEIGHTS_DIR" -maxdepth 1 -name "*.safetensors" -print -quit)" ]; then
         echo "Raw weights not found. Downloading model weights..."
         mkdir -p "$WEIGHTS_DIR"
         huggingface-cli download "$HF_MODEL_REPO" \
