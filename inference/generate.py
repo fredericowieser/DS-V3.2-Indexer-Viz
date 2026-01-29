@@ -492,13 +492,17 @@ def main(
         with open(input_file) as f:
             prompts = f.read().split("\n\n")
         assert len(prompts) <= args.max_batch_size, f"Number of prompts exceeds maximum batch size ({args.max_batch_size})"
-        print(f"DEBUG: Processing {len(prompts)} prompts.")
-        prompt_tokens = [tokenizer.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True, tokenize=True) for prompt in prompts]
         
-        if len(prompt_tokens) > 0:
-            print(f"DEBUG: Type of prompt_tokens[0]: {type(prompt_tokens[0])}")
-            print(f"DEBUG: First element of prompt_tokens[0]: {prompt_tokens[0][0] if len(prompt_tokens[0]) > 0 else 'EMPTY'}")
-            print(f"DEBUG: Type of first element: {type(prompt_tokens[0][0]) if len(prompt_tokens[0]) > 0 else 'N/A'}")
+        prompt_tokens = []
+        for prompt in prompts:
+            # Force return as PyTorch tensor, then convert to list to ensure List[List[int]]
+            res = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}], 
+                add_generation_prompt=True, 
+                tokenize=True, 
+                return_tensors="pt"
+            )
+            prompt_tokens.append(res[0].tolist())
 
         completion_tokens = generate(model, prompt_tokens, max_new_tokens, tokenizer.eos_token_id, temperature, tokenizer=tokenizer)
         completions = tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
