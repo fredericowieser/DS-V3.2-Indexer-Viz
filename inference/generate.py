@@ -495,14 +495,31 @@ def main(
         
         prompt_tokens = []
         for prompt in prompts:
-            # Force return as PyTorch tensor, then convert to list to ensure List[List[int]]
+            # apply_chat_template can return various types depending on tokenizer config
             res = tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}], 
                 add_generation_prompt=True, 
-                tokenize=True, 
-                return_tensors="pt"
+                tokenize=True
             )
-            prompt_tokens.append(res[0].tolist())
+            
+            # Handle different return types
+            if hasattr(res, "ids"):
+                # It's an Encoding object
+                prompt_tokens.append(res.ids)
+            elif isinstance(res, list) and len(res) > 0 and hasattr(res[0], "ids"):
+                 # It's a list of Encoding objects (e.g. from fast tokenizer)
+                 prompt_tokens.append(res[0].ids)
+            elif isinstance(res, list) and len(res) > 0 and isinstance(res[0], int):
+                 # It's already a list of IDs
+                 prompt_tokens.append(res)
+            elif isinstance(res, torch.Tensor):
+                 prompt_tokens.append(res.tolist())
+            else:
+                 # Fallback: try to convert to list, assuming it's iterable
+                 try:
+                     prompt_tokens.append(list(res))
+                 except:
+                     raise ValueError(f"Unexpected return type from tokenizer: {type(res)}")
 
         completion_tokens = generate(model, prompt_tokens, max_new_tokens, tokenizer.eos_token_id, temperature, tokenizer=tokenizer)
         completions = tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
