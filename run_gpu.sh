@@ -92,6 +92,6 @@ echo "Running inference..."
 python inference/generate.py \
     --ckpt-path "$CONVERTED_WEIGHTS_DIR" \
     --config "$CONFIG_PATH" \
-    --interactive \
+    --input-file "EM-LLM.txt" \
     --max-new-tokens 1 \
     --temperature 0.0
