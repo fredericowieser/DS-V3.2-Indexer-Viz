@@ -1,12 +1,14 @@
 import os
 import json
 import inspect
+import csv
 from argparse import ArgumentParser
 from copy import deepcopy
 from typing import List, Any
 import numpy as np
 from accelerate.utils import offload
 import accelerate.utils.modeling
+import torch.nn.functional as F
 
 # Monkeypatch accelerate to support FP8 offloading via int8 view
 _orig_offload_weight = offload.offload_weight
@@ -116,6 +118,7 @@ def generate(
     eos_id: int,
     temperature: float = 1.0,
     stop_token_seqs: List[List[int]] | None = None,
+    tokenizer: Any = None,
 ) -> List[List[int]]:
     """
     Generates new tokens based on the given prompt tokens using the specified model.
@@ -127,6 +130,7 @@ def generate(
         eos_id (int): The end-of-sequence token ID.
         temperature (float, optional): The temperature value for sampling. Defaults to 1.0.
         stop_token_seqs (List[List[int]] | None, optional): List of token sequences that stop generation. Defaults to None.
+        tokenizer (Any, optional): Tokenizer for decoding tokens (used for CSV logging). Defaults to None.
 
     Returns:
         List[List[int]]: A list of lists containing the generated tokens for each sequence.
@@ -146,8 +150,55 @@ def generate(
     generated: List[List[int]] = [[] for _ in range(len(prompt_tokens))]
     stop_token_seqs = stop_token_seqs or []
 
+    # List to store surprise data: (batch_idx, pos, token_id, token_raw, token_str, surprise)
+    surprise_data = []
+
     for cur_pos in range(min(prompt_lens), total_len):
-        logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+        if prev_pos == 0:
+            # First step (Prefill): request full logits to calculate surprise for prompt prefix
+            logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos, return_full_logits=True)
+            
+            # Calculate surprise for the prompt prefix: tokens[:, 1:cur_pos]
+            # logits[:, :-1, :] predicts tokens[:, 1:cur_pos]
+            
+            # Record the first token (index 0) for each batch element
+            for b in range(len(prompt_tokens)):
+                token_id_0 = int(tokens[b, 0].item())
+                token_raw_0 = tokenizer.convert_ids_to_tokens([token_id_0])[0] if tokenizer else str(token_id_0)
+                token_str_0 = tokenizer.decode([token_id_0]) if tokenizer else str(token_id_0)
+                surprise_data.append((b, 0, token_id_0, token_raw_0, token_str_0, 0.0))
+
+            if cur_pos > 1:
+                # Targets: tokens starting from index 1 up to cur_pos-1
+                targets_prefix = tokens[:, 1:cur_pos] # Shape [B, L-1]
+                logits_prefix = logits[:, :-1, :] # Shape [B, L-1, V]
+                
+                # Calculate negative log likelihood (surprise)
+                # Flatten for cross_entropy
+                B, L_minus_1, V = logits_prefix.shape
+                flat_logits = logits_prefix.reshape(-1, V)
+                flat_targets = targets_prefix.reshape(-1)
+                
+                # Using reduction='none' to get per-token loss
+                prefix_surprises = F.cross_entropy(flat_logits, flat_targets, reduction='none').view(B, L_minus_1)
+                
+                # Store
+                for b in range(B):
+                    for t_idx in range(L_minus_1):
+                        token_id = int(targets_prefix[b, t_idx].item())
+                        pos = t_idx + 1 # 1-based index
+                        surp = float(prefix_surprises[b, t_idx].item())
+                        token_raw = tokenizer.convert_ids_to_tokens([token_id])[0] if tokenizer else str(token_id)
+                        token_str = tokenizer.decode([token_id]) if tokenizer else str(token_id)
+                        surprise_data.append((b, pos, token_id, token_raw, token_str, surp))
+            
+            # For the continuation of the loop, use the last logit
+            logits = logits[:, -1, :] # [B, V]
+        else:
+            logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+        
+        # Now logits is [B, V], predicting token at cur_pos
+        
         if temperature > 0:
             next_token = sample(logits, temperature)
         else:
@@ -156,6 +207,22 @@ def generate(
         # Respect prompt tokens where prompt_mask is True
         next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
         tokens[:, cur_pos] = next_token
+
+        # Calculate surprise for next_token
+        # S(t) = -log P(x_t | x_<t)
+        probs = torch.softmax(logits, dim=-1)
+        token_probs = probs.gather(1, next_token.unsqueeze(1)).squeeze(1) # [B]
+        token_surprises = -torch.log(token_probs + 1e-10)
+        
+        for b in range(len(prompt_tokens)):
+            if finished[b].item() and not prompt_mask[b, cur_pos].item():
+                continue
+            
+            tok_id = int(next_token[b].item())
+            surp = float(token_surprises[b].item())
+            token_raw = tokenizer.convert_ids_to_tokens([tok_id])[0] if tokenizer else str(tok_id)
+            token_str = tokenizer.decode([tok_id]) if tokenizer else str(tok_id)
+            surprise_data.append((b, cur_pos, tok_id, token_raw, token_str, surp))
 
         # Update per-sample generated lists & stop conditions
         for i in range(len(prompt_tokens)):
@@ -185,6 +252,18 @@ def generate(
         prev_pos = cur_pos
         if finished.all():
             break
+
+    # Write surprise data to CSV (Rank 0 only)
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        csv_file = "surprise_values.csv"
+        file_exists = os.path.isfile(csv_file)
+        with open(csv_file, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["BatchID", "Pos", "TokenID", "RawToken", "DecodedToken", "Surprise"])
+            writer.writerows(surprise_data)
+        if surprise_data:
+            print(f"[SurpriseRecorder] Saved {len(surprise_data)} records to {csv_file}")
 
     # Return generated (already stripped prompt + stop seq), clipped to max_new_tokens
     completion_tokens: List[List[int]] = []
@@ -397,7 +476,8 @@ def main(
                 max_new_tokens, 
                 tokenizer.eos_token_id, 
                 temperature,
-                stop_token_seqs=stop_token_seqs
+                stop_token_seqs=stop_token_seqs,
+                tokenizer=tokenizer
             )
             completion = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
             
@@ -413,7 +493,7 @@ def main(
             prompts = f.read().split("\n\n")
         assert len(prompts) <= args.max_batch_size, f"Number of prompts exceeds maximum batch size ({args.max_batch_size})"
         prompt_tokens = [tokenizer.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True) for prompt in prompts]
-        completion_tokens = generate(model, prompt_tokens, max_new_tokens, tokenizer.eos_token_id, temperature)
+        completion_tokens = generate(model, prompt_tokens, max_new_tokens, tokenizer.eos_token_id, temperature, tokenizer=tokenizer)
         completions = tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
         for prompt, completion in zip(prompts, completions):
             print("Prompt:", prompt)

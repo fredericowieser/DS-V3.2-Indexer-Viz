@@ -1263,16 +1263,17 @@ class Transformer(nn.Module):
     # Iteratively passes the input through embeddings, all transformer blocks, and final normalization.
     # Projects the final hidden state to logits and gathers them across all workers if distributed.
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int = 0):
+    def forward(self, tokens: torch.Tensor, start_pos: int = 0, return_full_logits: bool = False):
         """
         Forward pass for the Transformer model.
 
         Args:
             tokens (torch.Tensor): Input tensor of token IDs with shape (batch_size, seq_len).
             start_pos (int, optional): Starting position in the sequence for rotary embeddings. Defaults to 0.
+            return_full_logits (bool, optional): Whether to return logits for all tokens. Defaults to False.
 
         Returns:
-            torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
+            torch.Tensor: Logits tensor of shape (batch_size, vocab_size) or (batch_size, seq_len, vocab_size).
         """
         if start_pos == 0: # Only reset on prefill start
             recorder.reset()
@@ -1284,7 +1285,12 @@ class Transformer(nn.Module):
         for layer in self.layers:
             h, residual = layer(h, residual, start_pos, freqs_cis, mask)
         h, _ = self.norm(h, residual)
-        logits = self.head(h[:, -1].float())
+        
+        if return_full_logits:
+            logits = self.head(h.float())
+        else:
+            logits = self.head(h[:, -1].float())
+            
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)
