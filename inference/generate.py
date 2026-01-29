@@ -503,23 +503,42 @@ def main(
             )
             
             # Handle different return types
-            if hasattr(res, "ids"):
+            if isinstance(res, dict) or hasattr(res, "keys"):
+                 # BatchEncoding or dict
+                 if "input_ids" in res:
+                     prompt_tokens.append(res["input_ids"])
+                 elif hasattr(res, "input_ids"):
+                     prompt_tokens.append(res.input_ids)
+                 elif hasattr(res, "ids"): # Encoding object acting like dict?
+                     prompt_tokens.append(res.ids)
+                 else:
+                     # iterate to find something that looks like ids? 
+                     # fallback for weird BatchEncoding if it iterates to Encoding
+                     try:
+                         # Attempt to treat as list of Encodings
+                         l = list(res)
+                         if len(l) > 0 and hasattr(l[0], "ids"):
+                             prompt_tokens.append(l[0].ids)
+                         else:
+                             raise ValueError(f"BatchEncoding/Dict without input_ids: {res.keys() if hasattr(res, 'keys') else '?'}")
+                     except:
+                        raise ValueError(f"Unknown dict-like return: {type(res)}")
+            elif hasattr(res, "ids"):
                 # It's an Encoding object
                 prompt_tokens.append(res.ids)
-            elif isinstance(res, list) and len(res) > 0 and hasattr(res[0], "ids"):
-                 # It's a list of Encoding objects (e.g. from fast tokenizer)
-                 prompt_tokens.append(res[0].ids)
-            elif isinstance(res, list) and len(res) > 0 and isinstance(res[0], int):
-                 # It's already a list of IDs
-                 prompt_tokens.append(res)
+            elif isinstance(res, list) and len(res) > 0:
+                if isinstance(res[0], int):
+                     # It's already a list of IDs
+                     prompt_tokens.append(res)
+                elif hasattr(res[0], "ids"):
+                     # It's a list of Encoding objects
+                     prompt_tokens.append(res[0].ids)
+                else:
+                     raise ValueError(f"List contains unexpected elements: {type(res[0])}")
             elif isinstance(res, torch.Tensor):
                  prompt_tokens.append(res.tolist())
             else:
-                 # Fallback: try to convert to list, assuming it's iterable
-                 try:
-                     prompt_tokens.append(list(res))
-                 except:
-                     raise ValueError(f"Unexpected return type from tokenizer: {type(res)}")
+                 raise ValueError(f"Unexpected return type from tokenizer: {type(res)}")
 
         completion_tokens = generate(model, prompt_tokens, max_new_tokens, tokenizer.eos_token_id, temperature, tokenizer=tokenizer)
         completions = tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
