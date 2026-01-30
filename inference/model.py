@@ -896,16 +896,40 @@ class MLA(nn.Module):
                 for h in range(self.n_local_heads):
                     recorder.save_vector(layer_id, "keys_attn", h, k_cpu[:, h, :])
 
-            scores = torch.einsum("bshd,bthd->bsht", q, k).mul_(self.softmax_scale)
-
-            # indexer
+            # Precompute index mask (S x S is small enough ~200MB for 10k tokens)
             topk_indices = self.indexer(x, qr, start_pos, freqs_cis, mask, layer_id=getattr(self, 'layer_id', -1))
-            index_mask = torch.full((bsz, seqlen, seqlen), float("-inf"), device=x.device).scatter_(-1, topk_indices, 0)
-            index_mask += mask
-            scores += index_mask.unsqueeze(2)
+            # index_mask: [B, S, S]
+            index_mask = torch.full((bsz, seqlen, seqlen), float("-inf"), device=x.device, dtype=q.dtype).scatter_(-1, topk_indices, 0)
+            
+            # Combine masks
+            # mask is [S, S] (causal), index_mask is [B, S, S]
+            combined_mask = index_mask + mask
 
-            scores = scores.softmax(dim=-1)
-            x = torch.einsum("bsht,bthd->bshd", scores, v)
+            # Chunked attention to avoid OOM with large sequences (e.g. S=10k -> scores [1, 128, 10k, 10k] ~ 25GB)
+            chunk_size = 512
+            x_chunks = []
+            
+            for i in range(0, seqlen, chunk_size):
+                end = min(i + chunk_size, seqlen)
+                q_chunk = q[:, i:end, :, :] # [B, Chunk, H, D]
+                
+                # scores: [B, Chunk, H, S]
+                # Size: 1 * 512 * 128 * 10000 * 2 bytes ~ 1.3 GB. Safe.
+                scores_chunk = torch.einsum("bshd,bthd->bsht", q_chunk, k)
+                scores_chunk.mul_(self.softmax_scale)
+                
+                # Add mask
+                mask_chunk = combined_mask[:, i:end, :].unsqueeze(2) # [B, Chunk, 1, S]
+                scores_chunk += mask_chunk
+                
+                scores_chunk = scores_chunk.softmax(dim=-1)
+                
+                # output: [B, Chunk, H, D_v]
+                x_chunk = torch.einsum("bsht,bthd->bshd", scores_chunk, v)
+                x_chunks.append(x_chunk)
+                
+            x = torch.cat(x_chunks, dim=1)
+
         else:                   # MQA decode
             # Manually trigger accelerate hook to load weights if needed
             if hasattr(self.wkv_b, "_hf_hook"):
