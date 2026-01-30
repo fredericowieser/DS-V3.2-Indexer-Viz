@@ -718,15 +718,48 @@ class Indexer(torch.nn.Module):
              recorder.save_matrix(layer_id, "weights_index", weights[0])
 
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
-        index_score = fp8_index(q_fp8.contiguous(), weights, self.k_cache[:bsz, :end_pos].contiguous(), self.k_scale_cache[:bsz, :end_pos].contiguous())
+
         if mask is not None:
-            index_score += mask
+             chunk_size = 512
+             topk_indices_list = []
+             seqlen = q_fp8.size(1)
+             
+             for i in range(0, seqlen, chunk_size):
+                 end = min(i + chunk_size, seqlen)
+                 q_fp8_chunk = q_fp8[:, i:end, :, :]
+                 weights_chunk = weights[:, i:end, :, :]
+                 
+                 # [B, Chunk, N]
+                 score_chunk = fp8_index(q_fp8_chunk.contiguous(), weights_chunk, self.k_cache[:bsz, :end_pos].contiguous(), self.k_scale_cache[:bsz, :end_pos].contiguous())
+                 
+                 # Add mask chunk
+                 # mask is [S, S], we need [Chunk, S] (broadcast over batch)
+                 mask_chunk = mask[i:end, :] # [Chunk, S]
+                 score_chunk += mask_chunk.unsqueeze(0) # [B, Chunk, S]
+                 
+                 # TopK
+                 # indices: [B, Chunk, K]
+                 topk_chunk = score_chunk.topk(min(self.index_topk, end_pos), dim=-1)[1]
+                 topk_indices_list.append(topk_chunk)
 
-        # NEW: Record Indexer Activations (Matrix)
-        if recorder.record_scores and layer_id != -1 and start_pos == 0:
-            recorder.save_matrix(layer_id, "activations_index", index_score[0])
+                 # Record chunk if needed (Partial recording logic?)
+                 # For now, we only record the first chunk if start_pos==0 to give *some* data without OOM
+                 if i == 0 and recorder.record_scores and layer_id != -1 and start_pos == 0:
+                      # This only saves the first 512 rows. Better than crashing.
+                      recorder.save_matrix(layer_id, "activations_index", score_chunk[0])
 
-        topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
+             topk_indices = torch.cat(topk_indices_list, dim=1)
+        
+        else:
+            index_score = fp8_index(q_fp8.contiguous(), weights, self.k_cache[:bsz, :end_pos].contiguous(), self.k_scale_cache[:bsz, :end_pos].contiguous())
+            if mask is not None:
+                index_score += mask
+
+            # NEW: Record Indexer Activations (Matrix)
+            if recorder.record_scores and layer_id != -1 and start_pos == 0:
+                recorder.save_matrix(layer_id, "activations_index", index_score[0])
+
+            topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
         
         if world_size > 1:
             topk_indices_ = topk_indices.clone()
