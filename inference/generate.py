@@ -490,7 +490,14 @@ def main(
             messages.append({"role": "assistant", "content": completion})
     else:
         with open(input_file) as f:
-            prompts = f.read().split("\n\n")
+            full_content = f.read().strip()
+        
+        if not full_content:
+            print(f"Warning: Input file {input_file} is empty.")
+            return
+
+        # Treat the entire file as a single prompt
+        prompts = [full_content]
         assert len(prompts) <= args.max_batch_size, f"Number of prompts exceeds maximum batch size ({args.max_batch_size})"
         
         prompt_tokens = []
